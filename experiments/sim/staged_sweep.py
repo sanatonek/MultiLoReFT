@@ -536,6 +536,7 @@ def train(model, dataloader, val_dataloader, device, epochs=1000, lr=1e-4, weigh
             optimizer = model.update_optimizer(optimizer)
     
     plot_losses(all_epoch_losses, loss_names=all_loss_names, save_path=f"./plots/{model_name}_loss.pdf")
+    save_checkpoint(model, optimizer, epoch, loss, filepath=f"./ckpts/{model_name}.pth")
 
     # return all training losses
     train_df = pd.DataFrame(all_epoch_losses, columns=all_loss_names)
@@ -565,6 +566,14 @@ def eval_model(model, test_h1, test_h2, test_labels, device, threshold=0.05):
 
     return regression_df, classification_df, rank_df
 
+def save_checkpoint(model, optimizer, epoch, loss, filepath):
+    """Save model checkpoint."""
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict()
+    }, filepath)
+
 def main(dev_id=0, seed=0, out_dir="./results/", file_name="sweep", sim_data='sim_100000_in5-5_data5-5_shared2_c2_shared', subset=10000):
     """Main function to run the training pipeline."""
     # add the seed to the file name
@@ -591,6 +600,8 @@ def main(dev_id=0, seed=0, out_dir="./results/", file_name="sweep", sim_data='si
     # create a folder for the sweep plots
     if not os.path.exists(f"./plots/{file_name}"):
         os.makedirs(f"./plots/{file_name}")
+    if not os.path.exists(f"./ckpts/{file_name}"):
+        os.makedirs(f"./ckpts/{file_name}")
     
     # load data
     loaded_data = np.load("./data/"+sim_data+".npz")
@@ -612,13 +623,15 @@ def main(dev_id=0, seed=0, out_dir="./results/", file_name="sweep", sim_data='si
     #batch_sizes = [64, 128, 256, 512]
     batch_sizes = [64, 128, 256, 512]
     #learning_rates = [1e-3, 1e-4, 1e-5]
-    learning_rates = [1e-4]
+    learning_rates = [1e-3, 1e-4, 1e-5]
     #lr_annealing = ['cosine', 'exponential', 'constant', 'reduceonplateau']
     lr_annealing = ['cosine', 'constant']
     #weight_decays = [1e-3, 1e-5, 0]
-    weight_decays = [0]
-    n_specific_rank = [2, 4, 6, 8]
-    n_shared_rank = [2, 4, 6, 8]
+    weight_decays = [1e-4, 0]
+    #n_specific_rank = [2, 4, 6, 8]
+    #n_shared_rank = [2, 4, 6, 8]
+    n_specific_rank = [4]
+    n_shared_rank = [4]
     epochs = 3000
     joint_patience = 50
     patience = 20
