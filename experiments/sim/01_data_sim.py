@@ -80,10 +80,14 @@ for n_samples in n_sample_options:
                     if data_dim1 < input_dim1:
                         continue
                     for shared_dim in shared_dim_options:
-                        if shared_dim > data_dim0 or shared_dim > data_dim1:
+                        if shared_dim > min(input_dim0, data_dim0) or shared_dim > min(input_dim1, data_dim1):
                             continue
                         for class_location in class_location_options:
                             data_name = f"sim_{n_samples}_in{input_dim0}-{input_dim1}_data{data_dim0}-{data_dim1}_shared{shared_dim}_c{n_classes}_{class_location}.npz"
+                            # if file already exists, skip
+                            if os.path.exists(f'./data/{data_name}'):
+                                print(f"File {data_name} already exists, skipping...")
+                                continue
                             h1, h2, x1, x2, labels = generate_multimodal_data(n_samples, save_path='./data/', input_dims=[input_dim0, input_dim1], data_dims=[data_dim0, data_dim1], shared_dim=shared_dim, n_classes=n_classes, class_location=class_location)
                             temp_df = eval_baseline(h1, h2, x1, x2, labels)
                             temp_df['n_samples'] = n_samples
