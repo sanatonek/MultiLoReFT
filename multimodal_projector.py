@@ -401,7 +401,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
     
     # Train model
-    train(projection_model, dataloader, val_dataloader, optimizer, device, scheduler, epochs=600)
+    train(projection_model, dataloader, val_dataloader, optimizer, device, scheduler, epochs=800)
 
 
 if __name__ == "__main__":

@@ -262,7 +262,7 @@ def compute_stage_losses(model, h1, h2, z_components, stage):
     if stage == "shared":
         return [l_shared, l_mi], ["Shared Loss", "Mutual Info Loss"], all_losses, all_loss_names
     elif stage == "private":
-        return [l_orthogonal], ["Orthogonal Loss"], all_losses, all_loss_names
+        return [l_orthogonal, l_mi], ["Orthogonal Loss", "Mutual Info Loss"], all_losses, all_loss_names
     elif stage == "joint":
         return [l_orthogonal, l_shared, l_mi], ["Orthogonal Loss", "Shared Loss", "Mutual Info Loss"], all_losses, all_loss_names
     else:
