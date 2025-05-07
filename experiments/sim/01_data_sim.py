@@ -73,11 +73,15 @@ class_location_options = ['shared', 'specific']
 for n_samples in n_sample_options:
     for input_dim0 in input_dims_0:
         for input_dim1 in input_dims_1:
+            if input_dim0 > input_dim1: # don't need double
+                continue
             for data_dim0 in data_dims_0:
                 if data_dim0 < input_dim0:
                     continue
                 for data_dim1 in data_dims_1:
                     if data_dim1 < input_dim1:
+                        continue
+                    elif data_dim0 > data_dim1: # don't need double
                         continue
                     for shared_dim in shared_dim_options:
                         if shared_dim > min(input_dim0, data_dim0) or shared_dim > min(input_dim1, data_dim1):
