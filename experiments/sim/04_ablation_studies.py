@@ -16,7 +16,7 @@ from sklearn.metrics import make_scorer, accuracy_score, precision_score, recall
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from utils import *
-from losses import *
+from losses_recon import *
 
 
 class MultimodalDataset(Dataset):
@@ -38,12 +38,14 @@ class MultimodalDataset(Dataset):
 class ProjectionModule(nn.Module):
     """Neural network module for multimodal projection learning."""
     
-    def __init__(self, input_dims, shared_rank, specific_rank):
+    def __init__(self, input_dims, shared_rank, specific_rank, mi_loss=True, crosscov_loss=False):
         super(ProjectionModule, self).__init__()
         self.shared_rank = shared_rank
         self.specific_rank = specific_rank
         self.threshold = 0.05
         self.pruned = False
+        self.mi_loss = mi_loss
+        self.crosscov_loss = crosscov_loss
         
         # Initialize projection matrices
         self.R_s = nn.Parameter(torch.randn(shared_rank, input_dims[0], dtype=torch.float32))
@@ -55,6 +57,18 @@ class ProjectionModule(nn.Module):
         
         # Create weight networks for each modality
         self._create_weight_networks(input_dims)
+
+        if not mi_loss:
+            self.decoder1 = nn.Sequential(
+                nn.Linear(input_dims[0], input_dims[0]*2, dtype=torch.float32),
+                nn.ReLU(),
+                nn.Linear(input_dims[0]*2, input_dims[0], dtype=torch.float32)
+            )
+            self.decoder2 = nn.Sequential(
+                nn.Linear(input_dims[1], input_dims[1]*2, dtype=torch.float32),
+                nn.ReLU(),
+                nn.Linear(input_dims[1]*2, input_dims[1], dtype=torch.float32)
+            )
     
     def _create_weight_networks(self, input_dims):
         """Create weight networks for each modality."""
@@ -161,17 +175,14 @@ class ProjectionModule(nn.Module):
         h2_out = torch.matmul((self.W_s1(h2) - torch.matmul(h2, self.R_s.T)), self.R_s) + \
                  torch.matmul((self.W_m1(h2) - torch.matmul(h2, self.R_m2.T)), self.R_m2)
         
-        # Compute shared projections - both weight output and projection match shared_rank
-        #shared_h1 = torch.matmul((self.W_s0(h1) - torch.matmul(h1, self.R_s.T)), self.R_s)
-        #shared_h2 = torch.matmul((self.W_s1(h2) - torch.matmul(h2, self.R_s.T)), self.R_s)
-        # Compute modality-specific projections - both weight output and projection match specific_rank
-        #specific_h1 = torch.matmul((self.W_m0(h1) - torch.matmul(h1, self.R_m1.T)), self.R_m1)
-        #specific_h2 = torch.matmul((self.W_m1(h2) - torch.matmul(h2, self.R_m2.T)), self.R_m2)
-        # Combine projections
-        #h1_out = shared_h1 + specific_h1
-        #h2_out = shared_h2 + specific_h2
-        
-        return h1_out, h2_out
+        if not self.mi_loss:
+            h1_pred = self.decoder1(h1_out)
+            h2_pred = self.decoder2(h2_out)
+            recons = [h1_pred, h2_pred]
+            return recons, [h1_out, h2_out]
+        else:
+            recons = [h1_out, h2_out]
+        return recons, [h1_out, h2_out]
     
     def decouple(self, phis, full=True, th=0.1):
         """Separate shared and modality-specific representations."""
@@ -211,7 +222,7 @@ def evaluate_validation_loss(model, val_dataloader, device):
             x1 = x1.float().to(device)
             x2 = x2.float().to(device)
             
-            phis = model([h1, h2])
+            recons, phis = model([h1, h2])
             z_components = model.decouple(phis, full=True)
             losses_list, _, _, _ = compute_stage_losses(model, h1, h2, z_components, model.trainable_stage)
             val_loss = torch.stack(losses_list).mean()
@@ -398,7 +409,7 @@ def eval_model(model, test_h1, test_h2, test_labels, device, threshold=0.05):
     # regression and classification
     h1 = F.normalize(torch.Tensor(test_h1).float(), dim=1).to(device)
     h2 = F.normalize(torch.Tensor(test_h2).float(), dim=1).to(device)
-    phis = model([h1,h2])
+    recons, phis = model([h1, h2])
     z_n = model.decouple(phis, full=True, th=0.05)
     regression_df = evaluate_regression(z_n, h1, h2)
     classification_df = evaluate_classification(z_n, test_labels[:, 0])
@@ -477,7 +488,10 @@ def train(
     # Training loop
     for epoch in range(epochs):
         total_loss = 0
-        epoch_losses = np.zeros(3)
+        if model.crosscov_loss:
+            epoch_losses = np.zeros(4)
+        else:
+            epoch_losses = np.zeros(3)
         
         # Initialize stage if first epoch
         if epoch == 0:
@@ -583,7 +597,7 @@ def train(
             x1 = x1.float().to(device)
             x2 = x2.float().to(device)
             
-            phis = model([h1, h2])
+            recons, phis = model([h1, h2])
             z_components = model.decouple(phis, full=True)
             losses_list, loss_names, all_losses, all_loss_names = compute_stage_losses(
                 model, h1, h2, z_components, model.trainable_stage)
@@ -678,9 +692,14 @@ def main(dev_id=0, out_dir="./results/", file_name="sweep", sim_data='sim_100000
     epochs = 3000
     joint_patience = 50
     patience = 20
-    joint = [True, False, False] # doing each individually
-    pruning = [True, False, True]
-    lossnorm = ['none', 'none', 'gradient']
+    #joint = [True, False, False, False] # doing each individually
+    #pruning = [True, False, True, True]
+    #lossnorm = ['gradient', 'gradient', 'none', 'gradient']
+    #mi_loss = [True, True, True, False]
+    joint = [False]
+    pruning = [True]
+    lossnorm = ['gradient']
+    mi_loss = [True]
 
     # sweep
     for seed in seeds:
@@ -697,7 +716,9 @@ def main(dev_id=0, out_dir="./results/", file_name="sweep", sim_data='sim_100000
             projection_model = ProjectionModule(
                 input_dims=input_dims,
                 shared_rank=sh, 
-                specific_rank=sr
+                specific_rank=sr,
+                mi_loss=mi_loss[i],
+                crosscov_loss=True,
             ).to(device)
             
             # Train model
@@ -713,7 +734,7 @@ def main(dev_id=0, out_dir="./results/", file_name="sweep", sim_data='sim_100000
                 joint=joint[i],
                 pruning=pruning[i],
                 scheduling=la,
-                model_name=f"{file_name}/joint-{joint[i]}_pruning-{pruning[i]}_lossnorm-{lossnorm[i]}_seed{seed}", 
+                model_name=f"{file_name}/joint-{joint[i]}_pruning-{pruning[i]}_lossnorm-{lossnorm[i]}_mi-{mi_loss[i]}_seed{seed}", 
                 patience1=patience, 
                 patience2=joint_patience)
             train_df['epoch'] = np.arange(len(train_df))
@@ -723,6 +744,7 @@ def main(dev_id=0, out_dir="./results/", file_name="sweep", sim_data='sim_100000
                 "joint": [joint[i]],
                 "pruning": [pruning[i]],
                 "lossnorm": [lossnorm[i]],
+                "mi_loss": [mi_loss[i]],
             })
             # add to the result dfs (repeat the len to match each df)
             train_df = pd.concat([train_df, pd.concat([param_df]*len(train_df), ignore_index=True)], axis=1)
