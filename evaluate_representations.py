@@ -9,6 +9,7 @@ import numpy as np
 from multimodal_projector import *
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from flickr import Multi30KMixedLangDataset
 
 
 def evaluate_predictability(z_n, labels, label_idx):
@@ -172,28 +173,45 @@ def plot_projection_matrices(model, threshold=0.00, save_dir="./plots"):
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dataset_name = "flickr"
     
-    # Load and prepare data
-    loaded_data = np.load("./data/simulated_data.npz")
-    h1 = loaded_data["h1"]
-    h2 = loaded_data["h2"]
-    x1 = loaded_data["x1"]
-    x2 = loaded_data["x2"]
-    labels = loaded_data["labels"][3000:]
+    if dataset_name=="simulated_data":
+        # Load and prepare data
+        loaded_data = np.load("./data/simulated_data.npz")
+        h1 = loaded_data["h1"]
+        h2 = loaded_data["h2"]
+        x1 = loaded_data["x1"]
+        x2 = loaded_data["x2"]
+        labels = loaded_data["labels"][3000:]
+        # Create dataset
+        dataset = MultimodalDataset(h1[3000:], h2[3000:], x1[3000:], x2[3000:], labels)  
+        # Load model
+        projection_model = ProjectionModule(input_dims=[5,5], shared_rank=4, specific_rank=4, data_dim={'A':5, 'B':6}).to(device)
+        checkpoint = load_checkpoint(filepath="./ckpts/projection_module.pth", model=projection_model)
+        # Get representations
+        h1 = F.normalize(torch.Tensor(dataset.h1).float(), dim=1).to(device)
+        h2 = F.normalize(torch.Tensor(dataset.h2).float(), dim=1).to(device)
+        phis = projection_model([h1,h2])
+        z_n = projection_model.decouple(phis, full=True, th=0.05)
     
-    # Create dataset
-    dataset = MultimodalDataset(h1[3000:], h2[3000:], x1[3000:], x2[3000:], labels)
-    
-    # Load model
-    projection_model = ProjectionModule(input_dims=[5,5], shared_rank=4, specific_rank=4, data_dim={'A':5, 'B':6}).to(device)
-    checkpoint = load_checkpoint(filepath="./ckpts/projection_module.pth", model=projection_model)
-    
-    # Get representations
-    h1 = F.normalize(torch.Tensor(dataset.h1).float(), dim=1).to(device)
-    h2 = F.normalize(torch.Tensor(dataset.h2).float(), dim=1).to(device)
-    phis = projection_model([h1,h2])
-    z_n = projection_model.decouple(phis, full=True, th=0.05)
-    
+    if dataset_name=="flickr":
+        test_dataset = Multi30KMixedLangDataset(split="test", device=device)
+        test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+        projection_model = ProjectionModule(
+                                    input_dims=[512,512], 
+                                    shared_rank=256, 
+                                    specific_rank=256, 
+                                    data_dim=None
+                                ).to(device)
+        z_n, labels = [], []
+        for batch in test_dataloader:
+            image_feats, text_feats, images, captions, label = batch
+            image_feats = image_feats.to(device)
+            text_feats = text_feats.to(device)
+            phis = projection_model([image_feats, text_feats])
+            z_n.append(projection_model.decouple(phis, full=True))
+            labels.extend(label)
+        z_n = torch.cat(z_n, dim=0)
     # Evaluate and plot
     plot_projection_matrices(projection_model)
     plot_representations(z_n, labels)
