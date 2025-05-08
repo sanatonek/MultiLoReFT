@@ -52,7 +52,7 @@ class ProjectionModule(nn.Module):
         self.W_s0 = nn.Sequential(
             nn.Linear(input_dims[0], input_dims[0] * 2, dtype=torch.float32),
             nn.ReLU(),
-            nn.Linear(input_dims[0] * 2, self.specific_rank, dtype=torch.float32)
+            nn.Linear(input_dims[0] * 2, self.shared_rank, dtype=torch.float32)
         )
         
         self.W_m0 = nn.Sequential(
@@ -65,7 +65,7 @@ class ProjectionModule(nn.Module):
         self.W_s1 = nn.Sequential(
             nn.Linear(input_dims[1], input_dims[1] * 2, dtype=torch.float32),
             nn.ReLU(),
-            nn.Linear(input_dims[1] * 2, self.specific_rank, dtype=torch.float32)
+            nn.Linear(input_dims[1] * 2, self.shared_rank, dtype=torch.float32)
         )
         
         self.W_m1 = nn.Sequential(
