@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from sim_data import generate_multimodal_data
+from tqdm import tqdm
 from utils import *
 from losses import *
 
@@ -184,8 +185,8 @@ def evaluate_validation_loss(model, val_dataloader, device):
             h1, h2, x1, x2, label = val_batch
             h1 = F.normalize(h1.float(), dim=1).to(device)
             h2 = F.normalize(h2.float(), dim=1).to(device)
-            x1 = x1.float().to(device)
-            x2 = x2.float().to(device)
+            # x1 = x1.float().to(device)
+            # x2 = x2.float().to(device)
             
             phis = model([h1, h2])
             z_components = model.decouple(phis, full=True)
@@ -199,6 +200,8 @@ def evaluate_validation_loss(model, val_dataloader, device):
 
 def train(model, dataloader, val_dataloader, optimizer, device, scheduler, epochs=100):
     """Train the projection model with early stopping."""
+    print(f"Training on device: {device}")
+    print(f"Model is on device: {next(model.parameters()).device}")
     # Initialize loss tracking
     loss_balancer = GradientNormalizedLoss(num_losses=3)
     all_epoch_losses = []
@@ -317,12 +320,13 @@ def train(model, dataloader, val_dataloader, optimizer, device, scheduler, epoch
                   f"epochs={stage_tracking['min_epochs_counter']}/{stage_config['max_epochs']}")
         
         # Training step
-        for batch in dataloader:
+        for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}"):
             h1, h2, x1, x2, label = batch
             h1 = F.normalize(h1.float(), dim=1).to(device)
             h2 = F.normalize(h2.float(), dim=1).to(device)
-            x1 = x1.float().to(device)
-            x2 = x2.float().to(device)
+            # If you use x1/x2 in your model/loss, move them to device as well:
+            # x1 = x1.float().to(device)
+            # x2 = x2.float().to(device)
             
             phis = model([h1, h2])
             z_components = model.decouple(phis, full=True)
@@ -350,7 +354,7 @@ def train(model, dataloader, val_dataloader, optimizer, device, scheduler, epoch
             optimizer = model.update_optimizer(optimizer)
         
         # Save checkpoint and print progress
-        if epoch % 20 == 0:
+        if epoch % 1 == 0:
             print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(dataloader)}")
             loss_report = ", ".join(f"{name}={val:.4f}" for val, name in zip(epoch_losses, all_loss_names))
             print(f"Loss values: {loss_report}")
