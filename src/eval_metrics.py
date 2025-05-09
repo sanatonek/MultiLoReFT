@@ -116,11 +116,15 @@ def evaluate_validation_loss(model, val_dataloader, device, verbose=False):
     phi1h2, phi2h1 = evaluate_cross_modal_retrieval(h1_outs, h2_outs, projector=model, device=device, labels=all_labels)
 
     predictabilities = []
+    predictability_labels = []
+    temp_preditability_labels = ['pred-zs1', 'pred-zs2', 'pred-zm1', 'pred-zm2']
     for label_idx in range(all_labels.shape[1]):
-        predictabilities.append(evaluate_predictability((z_n[0][0], z_n[0][1], z_n[1][0], z_n[1][1]), all_labels, label_idx))
+        temp_predictability = evaluate_predictability((z_n[0][0], z_n[0][1], z_n[1][0], z_n[1][1]), all_labels, label_idx)
+        predictabilities.extend(temp_predictability)
+        predictability_labels.extend([f'{temp_preditability_labels[i]}-{label_idx}' for i in range(len(temp_predictability))])
 
     model.train()
-    return val_total_loss / len(val_dataloader), all_accuracies + [phi1h2, phi2h1] + predictabilities, ['Acc h1_out', 'Acc h2_out', 'Acc Zm1', 'Acc Zm2', 'Acc Zs1', 'Acc Zs2', 'cross-modal AB', 'cross-modal BA', 'predictability 0', 'predictability 1', 'predictability 2']
+    return val_total_loss / len(val_dataloader), all_accuracies + [phi1h2, phi2h1] + predictabilities, ['Acc h1_out', 'Acc h2_out', 'Acc Zm1', 'Acc Zm2', 'Acc Zs1', 'Acc Zs2', 'cross-modal AB', 'cross-modal BA'] + predictability_labels
 
 ###
 from torch.utils.data import Dataset, DataLoader
@@ -466,12 +470,14 @@ def evaluate_predictability(z_n, labels, label_idx):
         task_type = "regression"
         metric_name = "R2 score"
     
+    scores = []
     for name, z in components:
         try:
             reg_model = SklearnTrainer(model=model, task_type=task_type)
             score, score_var = reg_model.train_and_evaluate(z.detach().cpu(), y, k=5)
-            return score
+            scores.append(score.item())
             #print(name, f"-----Predictive performance ({metric_name}): {score:.3f} (var: {score_var:.3f})")
         except Exception as e:
             #print(f"Error evaluating {name}: {str(e)}")
-            continue
+            scores.append(None)
+    return scores

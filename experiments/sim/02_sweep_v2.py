@@ -261,7 +261,7 @@ class MultiLoReFT(nn.Module):
         elif model_hyperparameters.get('lr_annealing') == 'exponential':
             scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
         elif model_hyperparameters.get('lr_annealing') == 'linear':
-            scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=epochs)
+            scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=early_stopping_config[self.trainable_stage]["max_epochs"])
         elif model_hyperparameters.get('lr_annealing') == 'constant':
             scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=epochs)
         
@@ -327,6 +327,14 @@ class MultiLoReFT(nn.Module):
                 if self.trainable_stage == "joint" and val_loss < self.stage_tracking['best_val_loss']:  # Index 2 is MI loss based on all_loss_names
                     self.prune_singular_values()
                     optimizer = self.update_optimizer(optimizer)
+                    if model_hyperparameters.get('lr_annealing') == 'cosine':
+                        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+                    elif model_hyperparameters.get('lr_annealing') == 'exponential':
+                        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+                    elif model_hyperparameters.get('lr_annealing') == 'linear':
+                        scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=early_stopping_config[self.trainable_stage]["max_epochs"])
+                    elif model_hyperparameters.get('lr_annealing') == 'constant':
+                        scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=epochs)
             
             if self.staging:
                 # Evaluate validation loss
@@ -370,6 +378,15 @@ class MultiLoReFT(nn.Module):
 
                     trainable_params = self.get_trainable_parameters()
                     optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=wd)
+
+                    if model_hyperparameters.get('lr_annealing') == 'cosine':
+                        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+                    elif model_hyperparameters.get('lr_annealing') == 'exponential':
+                        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+                    elif model_hyperparameters.get('lr_annealing') == 'linear':
+                        scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=early_stopping_config[self.trainable_stage]["max_epochs"])
+                    elif model_hyperparameters.get('lr_annealing') == 'constant':
+                        scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=epochs)
         
         # add the representation plots, correlation plots, and matrix plots to wandb
         h1 = F.normalize(torch.Tensor(val_dataloader.dataset.h1).float(), dim=1).to(self.device)
