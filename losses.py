@@ -33,7 +33,7 @@ class GradientNormalizedLoss:
         self.running_losses = torch.zeros(num_losses)
         self.running_count = 0
     
-    def __call__(self, losses, model, trainable_params):
+    def __call__(self, losses, trainable_params):
         """
         Compute gradient-normalized loss weights.
         
@@ -51,7 +51,7 @@ class GradientNormalizedLoss:
         # Compute gradients for each loss
         grads = []
         for loss in losses:
-            model.zero_grad()
+        #     model.zero_grad()
             loss.backward(retain_graph=True)
             
             # Collect gradients for trainable parameters
@@ -234,36 +234,3 @@ def loss_reconstruction_m(x, z, decoder):
 
 def loss_reconstruction_m(x, z, decoder):
     """Compute reconstruction loss between input and decoded representation."""
-def compute_stage_losses(model, h1, h2, z_components, stage):
-    """
-    Compute losses based on the current training stage.
-    
-    Args:
-        model: The projection model
-        h1, h2: Input representations
-        z_components: Decomposed representations
-        stage: Current training stage ("shared", "private", or "joint")
-        
-    Returns:
-        losses_list: List of losses to optimize
-        loss_names: Names of the losses
-        all_losses: All computed losses
-        all_loss_names: Names of all losses
-    """
-    # Compute all losses
-    l_shared = loss_shared_consistency(z_components[0][1], z_components[1][1])
-    l_orthogonal = loss_orthogonality(model.R_s, model.R_m1, model.R_m2)
-    l_mi = loss_mutual_info(h1, h2, z_components)
-    
-    all_losses = [l_shared.item(), l_orthogonal.item(), l_mi.item()]
-    all_loss_names = ["Shared Loss", "Orthogonal Loss", "Mutual Info Loss"]
-    
-    # Return appropriate losses based on stage
-    if stage == "shared":
-        return [l_shared, l_mi], ["Shared Loss", "Mutual Info Loss"], all_losses, all_loss_names
-    elif stage == "private":
-        return [l_orthogonal, l_mi], ["Orthogonal Loss", "Mutual Info Loss"], all_losses, all_loss_names
-    elif stage == "joint":
-        return [l_orthogonal, l_shared, l_mi], ["Orthogonal Loss", "Shared Loss", "Mutual Info Loss"], all_losses, all_loss_names
-    else:
-        raise ValueError(f"Unknown training stage: {stage}")
