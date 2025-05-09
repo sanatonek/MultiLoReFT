@@ -130,17 +130,18 @@ if __name__ == "__main__":
     english_encoder = BertModel.from_pretrained('bert-base-uncased').to(device)
     french_encoder = AutoModel.from_pretrained("sentence-transformers/LaBSE").to(device)
 
-    projection_model = ProjectionModule(
+    projection_model = MultiLoReFT(
         input_dims=[768,768], 
         shared_rank=512, 
         specific_rank=512, 
         data_dim=None, 
         threshold=1.,
-        encoders=[image_encoder, english_encoder, french_encoder]
+        encoders=[image_encoder, english_encoder, french_encoder],
+        device=device
     ).to(device)
     
     # Initialize optimizer and scheduler
-    optimizer = torch.optim.AdamW(projection_model.parameters(), lr=1e-3, weight_decay=1e-4)
+    # optimizer = torch.optim.AdamW(projection_model.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
     
 
@@ -165,21 +166,18 @@ if __name__ == "__main__":
         "shared": {
             "patience": 2,
             "min_improvement_ratio": 0.01,
-            "min_epochs": 1,
-            "max_epochs": 10
+            "max_epochs": 20
         },
         "private": {
             "patience": 2,
             "min_improvement_ratio": 0.01,
-            "min_epochs": 1,
-            "max_epochs": 10
+            "max_epochs": 20
         },
         "joint": {
             "patience": 2,
-            "min_improvement_ratio": 0.005,
-            "min_epochs": 1,
-            "max_epochs": 10
+            "min_improvement_ratio": 0.01,
+            "max_epochs": 2000
         }
     }
 
-    train(projection_model, train_dataloader, val_dataloader, optimizer, device, scheduler, early_stopping_config, epochs=100)
+    projection_model.train_projection(train_dataloader, val_dataloader, device, scheduler, early_stopping_config, epochs=100)

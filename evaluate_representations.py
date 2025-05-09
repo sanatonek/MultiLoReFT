@@ -18,7 +18,7 @@ from transformers import BertTokenizer, BertModel
 from transformers import AutoTokenizer, AutoModel
 
 
-def evaluate_cross_modal_retrieval(phi1, phi2, projector, device='cuda'):
+def evaluate_cross_modal_retrieval(phis0, phis1, projector, device, labels):
     """
     Evaluates cross-modal retrieval performance using cosine similarity.
 
@@ -33,17 +33,16 @@ def evaluate_cross_modal_retrieval(phi1, phi2, projector, device='cuda'):
     """
 
     # Compute similarity matrix
-    sim_matrix = phi1 @ phi2.T  # (N x N)
+    sim_matrix = phis0 @ phis1.T  # (N x N)
 
     def recall_at_k(sim_matrix, k, labels):
-        # sim_matrix: (batch_size, num_candidates)
-        # labels: (batch_size,) or (batch_size, 1)
-        # Get top-k indices
-        topk = sim_matrix.topk(k, dim=1).indices  # (batch_size, k)
+        topk = sim_matrix.topk(k, dim=1).indices
+        # Ensure labels is a tensor
+        if not torch.is_tensor(labels):
+            labels = torch.tensor(labels, device=sim_matrix.device)
         # Ensure labels is (batch_size, 1) for broadcasting
         if labels.dim() == 1:
             labels = labels.unsqueeze(1)
-        # Compare: (batch_size, k) == (batch_size, 1) -> (batch_size, k)
         correct = (topk == labels).any(dim=1).float()
         return correct.mean().item()
 
@@ -256,6 +255,7 @@ def main():
         phis = projection_model([h1,h2])
         z_n = projection_model.decouple(phis, full=True, th=0.05)
         (z1m, z1s, z2m, z2s) = z_n[0][0], z_n[0][1], z_n[1][0], z_n[1][1]
+        phi_1, phi_2 = phis[0], phis[1]
     
     if dataset_name=="flickr":
         test_dataset = Multi30KMixedLangDataset(split="test", device=device)
@@ -329,7 +329,7 @@ def main():
     plot_representations((z1m, z1s, z2m, z2s), labels)
     for label_idx in range(labels.shape[1]):
         evaluate_predictability((z1m, z1s, z2m, z2s), labels, label_idx)
-    evaluate_cross_modal_retrieval(phis[0], phis[1], projector=projection_model, device=device)
+    evaluate_cross_modal_retrieval(phi_1, phi_2, projector=projection_model, device=device, labels=labels)
     
     # Evaluate predictability for each label
 

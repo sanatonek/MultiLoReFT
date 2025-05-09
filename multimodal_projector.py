@@ -130,8 +130,8 @@ class MultiLoReFT(nn.Module):
             # Update parameter
             del self._parameters[name]
             self.register_parameter(name, nn.Parameter(reduced_R))
+            print(f">>>>>>>>>>>>>>>>>> Pruned dimensions kept {kept_s}")
             return getattr(self, name), keep_indices.sum().item()
-            print(f"Pruned dimensions kept {kept_s}")
         
         # Prune each matrix
         kept_s, kept_m1, kept_m2 = 0, 0, 0
@@ -240,21 +240,21 @@ class MultiLoReFT(nn.Module):
         return val_total_loss / len(val_dataloader)
 
 
-    def train_projection(self, dataloader, val_dataloader, optimizer, scheduler, early_stopping_config, epochs=100):
+    def train_projection(self, dataloader, val_dataloader, scheduler, early_stopping_config, epochs=100):
         """Train the projection model with early stopping."""
         print(f"Training on device: {self.device}")
         print(f"Model is on device: {next(self.parameters()).device}")
         # Initialize loss tracking
         loss_balancer = GradientNormalizedLoss(num_losses=3)
         all_epoch_losses = []
+        trainable_params = self.get_trainable_parameters()
+        optimizer = torch.optim.Adam(trainable_params, lr=1e-4, weight_decay=1e-4)
     
         
         # Training loop
         for epoch in range(epochs):
             total_loss = 0
             epoch_losses = np.zeros(3)
-            trainable_params = self.get_trainable_parameters()
-            optimizer = torch.optim.Adam(trainable_params, lr=1e-4, weight_decay=1e-4)
             # Training step
             for batch in (dataloader):
                 if self.encoders is not None:
@@ -297,19 +297,6 @@ class MultiLoReFT(nn.Module):
             all_epoch_losses.append(epoch_losses)
             scheduler.step()
             
-            # Initialize stage if first epoch
-            # if epoch == 0:
-            #     self.trainable_stage = "shared"
-            #     trainable_params = model.get_trainable_parameters()
-            #     optimizer = torch.optim.Adam(trainable_params, lr=1e-4, weight_decay=1e-4)
-            #     print(f"[Epoch {epoch}] → Starting with SHARED stage.")
-            #     stage_tracking = {
-            #         "best_val_loss": 500,#float('inf'),
-            #         "plateau_counter": 0,
-            #         "min_epochs_counter": 0,
-            #         "last_val_loss": 500,#float('inf'),
-            #         "initial_loss": None
-            #     }
             val_loss = self.evaluate_validation_loss(val_dataloader)
             if self.pruning:
                 # Prune if in joint stage
@@ -318,21 +305,17 @@ class MultiLoReFT(nn.Module):
                     optimizer = self.update_optimizer(optimizer)
             
             if self.staging:
-                # Evaluate validation loss
-                
-                # Update stage tracking
-                # if stage_tracking["initial_loss"] is None:
-                #     stage_tracking["initial_loss"] = val_loss
-                #     print(f"Initial {model.trainable_stage} stage loss: {val_loss:.4f}")
                 stage_config = early_stopping_config[self.trainable_stage]
                 self.stage_tracking["min_epochs_counter"] += 1
                 
                 # Calculate improvement
                 relative_improvement = (self.stage_tracking["best_val_loss"] - val_loss) / self.stage_tracking["best_val_loss"]
                 
+                if val_loss<self.stage_tracking["best_val_loss"]:
+                    self.stage_tracking["best_val_loss"] = val_loss
+                
                 # Update tracking metrics
                 if relative_improvement > stage_config["min_improvement_ratio"]:
-                    self.stage_tracking["best_val_loss"] = val_loss
                     self.stage_tracking["plateau_counter"] = 0
                 else:
                     self.stage_tracking["plateau_counter"] += 1
@@ -351,6 +334,8 @@ class MultiLoReFT(nn.Module):
                         self.trainable_stage = "joint"
                         print(f"***** [Epoch {epoch}] → Switched to JOINT stage after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
                     print(f"Final {self.trainable_stage} stage loss: {val_loss:.4f}")
+                    trainable_params = self.get_trainable_parameters()
+                    optimizer = torch.optim.Adam(trainable_params, lr=1e-4, weight_decay=1e-4)
                     self.stage_tracking["best_val_loss"] = 5000
                     self.stage_tracking["plateau_counter"] = 0
                     self.stage_tracking["min_epochs_counter"] = 0
@@ -406,19 +391,19 @@ def main():
         # Early stopping configuration
     early_stopping_config = {
         "shared": {
-            "patience": 10,
+            "patience": 7,
             "min_improvement_ratio": 0.01,
             # "min_epochs": 50,
-            "max_epochs": 200
+            "max_epochs": 400
         },
         "private": {
-            "patience": 10,
+            "patience": 7,
             "min_improvement_ratio": 0.01,
             # "min_epochs": 50,
-            "max_epochs": 200
+            "max_epochs": 400
         },
         "joint": {
-            "patience": 10,
+            "patience": 7,
             "min_improvement_ratio": 0.01,
             # "min_epochs": 100,
             "max_epochs": 300
@@ -440,7 +425,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
     
     # Train model
-    projection_model.train_projection(dataloader, val_dataloader, optimizer, scheduler, early_stopping_config, epochs=800)
+    projection_model.train_projection(dataloader, val_dataloader, scheduler, early_stopping_config, epochs=800)
 
 
 if __name__ == "__main__":
