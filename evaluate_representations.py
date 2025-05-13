@@ -18,7 +18,7 @@ from transformers import BertTokenizer, BertModel
 from transformers import AutoTokenizer, AutoModel
 
 
-def evaluate_cross_modal_retrieval(phis0, phis1, projector, device, labels):
+def evaluate_cross_modal_retrieval(phis0, phis1, projector, device):
     """
     Evaluates cross-modal retrieval performance using cosine similarity.
 
@@ -37,13 +37,13 @@ def evaluate_cross_modal_retrieval(phis0, phis1, projector, device, labels):
 
     def recall_at_k(sim_matrix, k, labels):
         topk = sim_matrix.topk(k, dim=1).indices
-        # Ensure labels is a tensor
-        if not torch.is_tensor(labels):
-            labels = torch.tensor(labels, device=sim_matrix.device)
-        # Ensure labels is (batch_size, 1) for broadcasting
-        if labels.dim() == 1:
-            labels = labels.unsqueeze(1)
-        correct = (topk == labels).any(dim=1).float()
+        
+        # For each query i, its true match is at index i
+        # Create a column vector of indices [0,1,2,...,N-1]
+        true_matches = torch.arange(sim_matrix.shape[0], device=sim_matrix.device).unsqueeze(1)
+        
+        # Check if true matching index appears in top k predictions
+        correct = (topk == true_matches).any(dim=1).float()
         return correct.mean().item()
 
     results = {
@@ -136,11 +136,11 @@ def plot_representations(z_n, labels, save_dir="./plots"):
                 # Normal PCA case (2+ dimensions)
                 pca = PCA(n_components=2)
                 x = pca.fit_transform(data)
-                ax.scatter(x[:, 0], x[:, 1], c=labels[:, l_ind])
+                ax.scatter(x[:, 0], x[:, 1], c=labels[:, l_ind].cpu().numpy())
             elif data.shape[1] == 1:
                 # Handle 1D case by adding a zero column for visualization
                 x = np.hstack([data, np.zeros_like(data)])
-                ax.scatter(x[:, 0], x[:, 1], c=labels[:, l_ind])
+                ax.scatter(x[:, 0], x[:, 1], c=labels[:, l_ind].cpu().numpy())
             else:
                 # If no valid features, just write "No Data"
                 ax.text(0.5, 0.5, "No Data", horizontalalignment='center', verticalalignment='center')
@@ -220,7 +220,7 @@ def plot_projection_matrices(model, threshold=0.00, save_dir="./plots"):
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset_name = "simulated_data"
+    dataset_name = "flickr"
     # Load CLIP (English only)
     clip_model, clip_preprocess = clip.load("ViT-B/32", device=device)
     clip_model.eval()
@@ -260,44 +260,60 @@ def main():
     if dataset_name=="flickr":
         test_dataset = Multi30KMixedLangDataset(split="test", device=device)
         test_dataloader = DataLoader(test_dataset, batch_size=256, shuffle=False)
-        image_encoder = timm.create_model('vit_base_patch14_dinov2', pretrained=True)
-        english_encoder = BertModel.from_pretrained('bert-base-uncased').to(device)
-        french_encoder = AutoModel.from_pretrained("sentence-transformers/LaBSE").to(device)
+        # image_encoder = timm.create_model('vit_base_patch14_dinov2', pretrained=True)
+        # english_encoder = BertModel.from_pretrained('bert-base-uncased').to(device)
+        # french_encoder = AutoModel.from_pretrained("sentence-transformers/LaBSE").to(device)
         projection_model = MultiLoReFT(
-                                    input_dims=[512,512], 
-                                    shared_rank=256, 
-                                    specific_rank=256, 
-                                    data_dim=None,
-                                    encoders=[image_encoder, english_encoder, french_encoder]
+                                    input_dims=[768,768], 
+                                    shared_rank=128, 
+                                    specific_rank=128, 
+                                    device=device
                                 ).to(device)
+                                
+        checkpoint = load_checkpoint(filepath="./ckpts/flickr_model.pth", model=projection_model)
+        projection_model.eval()
+        projection_model = projection_model.to(device)
         labels = []
         z1s, z2s, z1m, z2m = [], [], [], []
         phi_1, phi_2 = [], []
         with torch.no_grad():
             for batch in test_dataloader:
-                x1, x2, label = batch
-                projection_model.encoders[0] = projection_model.encoders[0].to(device)
-                projection_model.encoders[1] = projection_model.encoders[1].to(device)
-                projection_model.encoders[2] = projection_model.encoders[2].to(device)
-                projection_model.encoders[0].eval()
-                projection_model.encoders[1].eval()
-                projection_model.encoders[2].eval()
-                label = label.to(device)
+                image_feats, h2, x1, captions, label = batch
+                # Generate random binary labels for each item in batch
+                lang_idx = torch.randint(0, 2, (len(x1),))
+                # Use the labels to select language for each item
+                lang_idx = lang_idx.to(device)
+                text_feats = torch.stack([h2[0], h2[1]], dim=1).gather(
+                    1, lang_idx.unsqueeze(1).unsqueeze(2).expand(-1, -1, h2[0].shape[-1])
+                ).squeeze(1)
+                captions = [captions[0][i] if idx == 0 else captions[1][i] for i, idx in enumerate(lang_idx)]
+                label = lang_idx
+
+                # Randomly choose language (0=English, 1=French)
+                # lang_idx = random.randint(0, 1)
+                # text_feats = text_feats[lang_idx]
+                # captions = captions[lang_idx]
+                # projection_model.encoders[0] = projection_model.encoders[0].to(device)
+                # projection_model.encoders[1] = projection_model.encoders[1].to(device)
+                # projection_model.encoders[2] = projection_model.encoders[2].to(device)
+                # projection_model.encoders[0].eval()
+                # projection_model.encoders[1].eval()
+                # projection_model.encoders[2].eval()
 
                 # preprocess = get_dino_preprocess()
-                image = (x1).to(device)
-                tokens_en = BertTokenizer.from_pretrained('bert-base-uncased')(x2, return_tensors="pt", padding=True, truncation=True).to(device)
-                tokens_fr = AutoTokenizer.from_pretrained("sentence-transformers/LaBSE")(x2, padding=True, truncation=True, return_tensors="pt").to(device)
-                with torch.no_grad():
-                    model_output = projection_model.encoders[2](**tokens_fr)
-                    embeddings_fr = model_output.last_hidden_state[:, 0, :].to(device)
+                # image = (x1).to(device)
+                # tokens_en = BertTokenizer.from_pretrained('bert-base-uncased')(x2, return_tensors="pt", padding=True, truncation=True).to(device)
+                # tokens_fr = AutoTokenizer.from_pretrained("sentence-transformers/LaBSE")(x2, padding=True, truncation=True, return_tensors="pt").to(device)
+                # with torch.no_grad():
+                    # model_output = projection_model.encoders[2](**tokens_fr)
+                    # embeddings_fr = model_output.last_hidden_state[:, 0, :].to(device)
                 
-                    model_output = projection_model.encoders[1](**tokens_en)
-                    embeddings_en = model_output.last_hidden_state[:, 0, :].to(device)
+                    # model_output = projection_model.encoders[1](**tokens_en)
+                    # embeddings_en = model_output.last_hidden_state[:, 0, :].to(device)
                     
-                    image_feats = projection_model.encoders[0].forward_features(image)[:, 0, :].to(device)
-                    text_feats = torch.where(label.unsqueeze(1).expand(-1, embeddings_en.size(1)) == 0, embeddings_en, embeddings_fr)
-                    captions = x2
+                    # image_feats = projection_model.encoders[0].forward_features(image)[:, 0, :].to(device)
+                    # text_feats = torch.where(label.unsqueeze(1).expand(-1, embeddings_en.size(1)) == 0, embeddings_en, embeddings_fr)
+                    # captions = x2
                 # image_feats, text_feats, images, captions, label = batch
                 # image_feats = image_feats.to(device)
                 # text_feats = text_feats.to(device)

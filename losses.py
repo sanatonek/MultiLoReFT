@@ -201,10 +201,27 @@ def loss_orthogonality(R_s, R_m1, R_m2):
     """
     Ensure orthogonality between shared and modality-specific spaces.
     """
-    loss_ortho_1 = torch.norm(torch.mm(R_s, R_m1.T), p="fro")**2
-    loss_ortho_2 = torch.norm(torch.mm(R_m1, R_m2.T), p="fro")**2
-    loss_ortho_3 = torch.norm(torch.mm(R_s, R_m2.T), p="fro")**2
-    return loss_ortho_1 + loss_ortho_2 + loss_ortho_3
+    # loss_ortho_1 = torch.norm(torch.mm(R_s, R_m1.T), p="fro")**2/ R_s.numel()
+    # loss_ortho_2 = torch.norm(torch.mm(R_m1, R_m2.T), p="fro")**2/ R_m1.numel()
+    # loss_ortho_3 = torch.norm(torch.mm(R_s, R_m2.T), p="fro")**2/ R_s.numel()
+    # return loss_ortho_1 + loss_ortho_2 + loss_ortho_3
+    def safe_normalize(x):
+        return x / (x.norm(dim=-1, keepdim=True) + 1e-8)
+
+    R_s = safe_normalize(R_s)
+    R_m1 = safe_normalize(R_m1)
+    R_m2 = safe_normalize(R_m2)
+
+    # Use mean of squared cosine similarities instead of Frobenius norm directly
+    def ortho_pair(A, B):
+        prod = torch.mm(A, B.T)
+        return (prod ** 2).mean()
+
+    loss_ortho_1 = ortho_pair(R_s, R_m1)
+    loss_ortho_2 = ortho_pair(R_m1, R_m2)
+    loss_ortho_3 = ortho_pair(R_s, R_m2)
+
+    return (loss_ortho_1 + loss_ortho_2 + loss_ortho_3)
 
 def loss_shared_consistency(z_s1, z_s2):
     """

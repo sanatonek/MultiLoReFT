@@ -7,7 +7,11 @@ from sim_data import generate_multimodal_data
 from tqdm import tqdm
 from utils import *
 from losses import *
+import random
 from transformers import BertTokenizer, AutoTokenizer
+from torch.cuda.amp import autocast
+
+DATASET="flickr"
 
 class MultimodalDataset(Dataset):
     """Dataset class for multimodal data."""
@@ -43,13 +47,13 @@ class MultiLoReFT(nn.Module):
         self.device = device
         if staging:
             self.trainable_stage = "shared"
-            self.stage_tracking = {
-                    "best_val_loss": 5000,
-                    "plateau_counter": 0,
-                    "min_epochs_counter": 0,
-                }
         else:
             self.trainable_stage = "joint"
+        self.stage_tracking = {
+                "best_val_loss": 5000,
+                "plateau_counter": 0,
+                "min_epochs_counter": 0,
+            }
         
         # Initialize projection matrices
         self.R_s = nn.Parameter(torch.randn(shared_rank, max(input_dims[0], input_dims[1]), dtype=torch.float32))
@@ -88,9 +92,9 @@ class MultiLoReFT(nn.Module):
     
     def _orthogonal_init(self):
         """Initialize projection matrices with uniform distribution."""
-        torch.nn.init.uniform_(self.R_s, -0.9, 0.9)
-        torch.nn.init.uniform_(self.R_m1, -0.9, 0.9)
-        torch.nn.init.uniform_(self.R_m2, -0.9, 0.9)
+        torch.nn.init.uniform_(self.R_s, -0.1, 0.1)
+        torch.nn.init.uniform_(self.R_m1, -0.1, 0.1)
+        torch.nn.init.uniform_(self.R_m2, -0.1, 0.1)
     
     def get_trainable_parameters(self):
         """Get parameters to train based on current stage."""
@@ -108,14 +112,24 @@ class MultiLoReFT(nn.Module):
             if len(S) < 2:
                 return R, len(S)
             
-            min_sv_idx = torch.argmin(S)
-            min_sv = S[min_sv_idx]
-            if min_sv > self.pruning_threshold:
-                return R, len(S)
-            
-            # Create mask for keeping dimensions
+            # Original code that removes one at a time
+            # min_sv_idx = torch.argmin(S)
+            # min_sv = S[min_sv_idx]
+            # if min_sv > self.pruning_threshold:
+            #     return R, len(S)
+            # 
+            # # Create mask for keeping dimensions
+            # keep_indices = torch.ones(R.shape[0], dtype=torch.bool)
+            # keep_indices[:len(S)][min_sv_idx] = False
+            # reduced_R = R[keep_indices, :]
+
+            # New code that removes all dimensions below threshold at once
             keep_indices = torch.ones(R.shape[0], dtype=torch.bool)
-            keep_indices[:len(S)][min_sv_idx] = False
+            keep_indices[:len(S)] = S >= self.pruning_threshold
+            
+            if torch.all(keep_indices[:len(S)]):
+                return R, len(S)
+                
             reduced_R = R[keep_indices, :]
             
             # Update weight networks
@@ -130,7 +144,7 @@ class MultiLoReFT(nn.Module):
             # Update parameter
             del self._parameters[name]
             self.register_parameter(name, nn.Parameter(reduced_R))
-            print(f">>>>>>>>>>>>>>>>>> Pruned dimensions kept {kept_s}")
+            print(f">>>>>>>>>>>>>>>>>> Pruned %s to %d dimensions "%(name, len(reduced_R)))
             return getattr(self, name), keep_indices.sum().item()
         
         # Prune each matrix
@@ -151,14 +165,38 @@ class MultiLoReFT(nn.Module):
         """Update optimizer after pruning."""
         return torch.optim.Adam(self.parameters(), lr=optimizer.param_groups[0]["lr"])
     
+    # def forward(self, embeddings):
+    #     """Performing the representation fine-tuning."""
+    #     h1, h2 = embeddings[0], embeddings[1]
+    #     # Compute projections
+    #     h1_out = h1 + (self.W_s0(h1) - F.linear(h1, self.R_s.T)) @ self.R_s + (self.W_m0(h1) - F.linear(h1, self.R_m1.T)) @ self.R_m1
+    #     h2_out = h2 + (self.W_s1(h2) - F.linear(h2, self.R_s.T)) @ self.R_s + (self.W_m1(h2) - F.linear(h2, self.R_m2.T)) @ self.R_m2
+    #     # h1_out = h1 + torch.matmul((self.W_s0(h1) - torch.matmul(h1, self.R_s.T)), self.R_s) + \
+    #     #          torch.matmul((self.W_m0(h1) - torch.matmul(h1, self.R_m1.T)), self.R_m1)
+    #     # h2_out = h2 + torch.matmul((self.W_s1(h2) - torch.matmul(h2, self.R_s.T)), self.R_s) + \
+    #     #          torch.matmul((self.W_m1(h2) - torch.matmul(h2, self.R_m2.T)), self.R_m2)
+    #     return h1_out, h2_out
     def forward(self, embeddings):
-        """Performing the representation fine-tuning."""
-        h1, h2 = embeddings[0], embeddings[1]
-        # Compute projections
-        h1_out = h1 + torch.matmul((self.W_s0(h1) - torch.matmul(h1, self.R_s.T)), self.R_s) + \
-                 torch.matmul((self.W_m0(h1) - torch.matmul(h1, self.R_m1.T)), self.R_m1)
-        h2_out = h2 + torch.matmul((self.W_s1(h2) - torch.matmul(h2, self.R_s.T)), self.R_s) + \
-                 torch.matmul((self.W_m1(h2) - torch.matmul(h2, self.R_m2.T)), self.R_m2)
+        h1 = F.normalize(embeddings[0], p=2, dim=-1)
+        h2 = F.normalize(embeddings[1], p=2, dim=-1)
+        # Shared projections
+        proj_s0 = self.W_s0(h1) - F.linear(h1, self.R_s)             # (B, shared_rank)
+        shared_h1 = F.linear(proj_s0, self.R_s.T)                    # (B, D)
+
+        proj_s1 = self.W_s1(h2) - F.linear(h2, self.R_s)
+        shared_h2 = F.linear(proj_s1, self.R_s.T)
+
+        # Modality-specific projections
+        proj_m0 = self.W_m0(h1) - F.linear(h1, self.R_m1)
+        spec_h1 = F.linear(proj_m0, self.R_m1.T)
+
+        proj_m1 = self.W_m1(h2) - F.linear(h2, self.R_m2)
+        spec_h2 = F.linear(proj_m1, self.R_m2.T)
+
+        # Final representations
+        h1_out = h1 + shared_h1 + spec_h1
+        h2_out = h2 + shared_h2 + spec_h2
+
         return h1_out, h2_out
 
 
@@ -176,8 +214,10 @@ class MultiLoReFT(nn.Module):
         # Decouple representations
         for i, phi in enumerate(phis):
             if full:
-                zs = torch.matmul(phi, self.R_s.T)
-                zm = torch.matmul(phi, (self.R_m1.T if i==0 else self.R_m2.T))
+                # zs = torch.matmul(phi, self.R_s.T)
+                # zm = torch.matmul(phi, (self.R_m1.T if i==0 else self.R_m2.T))
+                zs = F.linear(phi, self.R_s)
+                zm = F.linear(phi, (self.R_m1 if i==0 else self.R_m2))
             else:
                 zs = torch.matmul(z, self.R_s[shared_sv].T)
                 zm = torch.matmul(z, (self.R_m1[m1_sv].T if i==0 else self.R_m2[m2_sv].T))
@@ -198,7 +238,7 @@ class MultiLoReFT(nn.Module):
         if self.trainable_stage == "shared":
             return [l_shared, l_mi], ["Shared Loss", "Mutual Info Loss"], all_losses, all_loss_names
         elif self.trainable_stage == "private":
-            return [l_orthogonal, l_mi], ["Orthogonal Loss", "Mutual Info Loss"], all_losses, all_loss_names
+            return [l_orthogonal, l_mi, l_shared], ["Orthogonal Loss", "Mutual Info Loss", "Shared Loss"], all_losses, all_loss_names
         elif self.trainable_stage == "joint":
             return [l_orthogonal, l_shared, l_mi], ["Orthogonal Loss", "Shared Loss", "Mutual Info Loss"], all_losses, all_loss_names
         else:
@@ -227,6 +267,13 @@ class MultiLoReFT(nn.Module):
                         h2 = torch.where(label.unsqueeze(1).expand(-1, embeddings_en.size(1)) == 0, embeddings_en, embeddings_fr)
                 else:
                     h1, h2, x1, x2, label = val_batch
+                    if DATASET == "flickr":
+                        # Generate random binary labels for each item in batch
+                        lang_idx = torch.randint(0, 2, (len(h1),), device=self.device)
+                        # Use the labels to select language for each item
+                        h2 = torch.stack([h2[0], h2[1]], dim=1).gather(1, lang_idx.unsqueeze(1).unsqueeze(2).expand(-1, -1, h2[0].shape[-1])).squeeze(1)
+                        x2 = [x2[0][i] if idx == 0 else x2[1][i] for i, idx in enumerate(lang_idx)]
+                        label = lang_idx
                 
                 h1 = F.normalize(h1.float(), dim=1).to(self.device)
                 h2 = F.normalize(h2.float(), dim=1).to(self.device)
@@ -240,7 +287,7 @@ class MultiLoReFT(nn.Module):
         return val_total_loss / len(val_dataloader)
 
 
-    def train_projection(self, dataloader, val_dataloader, scheduler, early_stopping_config, epochs=100):
+    def train_projection(self, dataloader, val_dataloader, early_stopping_config, lr=1e-3, epochs=100, save_path="./ckpts/projection_module.pth"):
         """Train the projection model with early stopping."""
         print(f"Training on device: {self.device}")
         print(f"Model is on device: {next(self.parameters()).device}")
@@ -248,8 +295,8 @@ class MultiLoReFT(nn.Module):
         loss_balancer = GradientNormalizedLoss(num_losses=3)
         all_epoch_losses = []
         trainable_params = self.get_trainable_parameters()
-        optimizer = torch.optim.Adam(trainable_params, lr=1e-4, weight_decay=1e-4)
-    
+        optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
         
         # Training loop
         for epoch in range(epochs):
@@ -274,6 +321,13 @@ class MultiLoReFT(nn.Module):
                         h2 = torch.where(label.unsqueeze(1).expand(-1, embeddings_en.size(1)) == 0, embeddings_en, embeddings_fr)
                 else:
                     h1, h2, x1, x2, label = batch
+                    if DATASET == "flickr":
+                        # Generate random binary labels for each item in batch
+                        lang_idx = torch.randint(0, 2, (len(h1),), device=self.device)
+                        # Use the labels to select language for each item
+                        h2 = torch.stack([h2[0], h2[1]], dim=1).gather(1, lang_idx.unsqueeze(1).unsqueeze(2).expand(-1, -1, h2[0].shape[-1])).squeeze(1)
+                        x2 = [x2[0][i] if idx == 0 else x2[1][i] for i, idx in enumerate(lang_idx)]
+                        label = lang_idx
                 
                 h1 = F.normalize(h1.float(), dim=1).to(self.device)
                 h2 = F.normalize(h2.float(), dim=1).to(self.device)
@@ -300,9 +354,11 @@ class MultiLoReFT(nn.Module):
             val_loss = self.evaluate_validation_loss(val_dataloader)
             if self.pruning:
                 # Prune if in joint stage
-                if self.trainable_stage == "joint" and val_loss < self.stage_tracking['best_val_loss']:  # Index 2 is MI loss based on all_loss_names
+                if self.trainable_stage == "joint" and val_loss < self.stage_tracking['best_val_loss'] and epoch>40:  # Index 2 is MI loss based on all_loss_names
                     self.prune_singular_values()
                     optimizer = self.update_optimizer(optimizer)
+                    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
+            
             
             if self.staging:
                 stage_config = early_stopping_config[self.trainable_stage]
@@ -326,7 +382,7 @@ class MultiLoReFT(nn.Module):
                     self.stage_tracking["min_epochs_counter"] >= stage_config["max_epochs"]
                 )
                 
-                if should_switch:
+                if self.staging and should_switch:
                     if self.trainable_stage == "shared":
                         self.trainable_stage = "private"
                         print(f"***** [Epoch {epoch}] → Switched to PRIVATE stage after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
@@ -335,7 +391,8 @@ class MultiLoReFT(nn.Module):
                         print(f"***** [Epoch {epoch}] → Switched to JOINT stage after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
                     print(f"Final {self.trainable_stage} stage loss: {val_loss:.4f}")
                     trainable_params = self.get_trainable_parameters()
-                    optimizer = torch.optim.Adam(trainable_params, lr=1e-4, weight_decay=1e-4)
+                    optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-4)
+                    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
                     self.stage_tracking["best_val_loss"] = 5000
                     self.stage_tracking["plateau_counter"] = 0
                     self.stage_tracking["min_epochs_counter"] = 0
@@ -345,21 +402,22 @@ class MultiLoReFT(nn.Module):
                 # optimizer = torch.optim.Adam(trainable_params, lr=1e-4, weight_decay=1e-4)
             
             # Print progress
-            if epoch % 10 == 0:
+            if epoch % 1 == 0:
                 print(f"[Epoch {epoch}] {self.trainable_stage.upper()} stage: "
                     f"val_loss={val_loss:.4f}, "
-                    f"best_val_loss={self.stage_tracking['best_val_loss']:.4f}, "
-                    f"relative_improvement={relative_improvement*100:.2f}%, "
-                    f"plateau={self.stage_tracking['plateau_counter']}/{stage_config['patience']}, "
-                    f"epochs={self.stage_tracking['min_epochs_counter']}/{stage_config['max_epochs']}")
+                    f"best_val_loss={self.stage_tracking['best_val_loss']:.4f}, ")
                 loss_report = ", ".join(f"{name}={val:.4f}" for val, name in zip(epoch_losses, all_loss_names))
                 print(f"Loss values: {loss_report}")
-            self.save_checkpoint(optimizer, epoch, loss, filepath="./ckpts/projection_module.pth")
+                if self.staging:
+                    print(f"relative_improvement={relative_improvement*100:.2f}%, "
+                    f"plateau={self.stage_tracking['plateau_counter']}/{stage_config['patience']}, "
+                    f"epochs={self.stage_tracking['min_epochs_counter']}/{stage_config['max_epochs']}")
+            self.save_checkpoint(optimizer, epoch, loss, filepath=save_path)
         
         # Plot final losses
         all_epoch_losses = np.array(all_epoch_losses)
         plot_losses(all_epoch_losses, loss_names=all_loss_names, save_path="./plots/loss_curves.pdf")
-        self.save_checkpoint(optimizer, epoch, loss, filepath="./ckpts/projection_module.pth")
+        self.save_checkpoint(optimizer, epoch, loss, filepath=save_path)
 
 
     def save_checkpoint(self, optimizer, epoch, loss, filepath):
@@ -420,12 +478,9 @@ def main():
         device=device
     ).to(device)
     
-    # Initialize optimizer and scheduler
-    optimizer = torch.optim.AdamW(projection_model.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
-    
+
     # Train model
-    projection_model.train_projection(dataloader, val_dataloader, scheduler, early_stopping_config, epochs=800)
+    projection_model.train_projection(dataloader, val_dataloader, early_stopping_config, epochs=800)
 
 
 if __name__ == "__main__":
