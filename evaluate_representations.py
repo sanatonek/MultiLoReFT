@@ -270,14 +270,18 @@ def main():
                                     device=device
                                 ).to(device)
                                 
-        checkpoint = load_checkpoint(filepath="./ckpts/flickr_model.pth", model=projection_model)
+        # checkpoint = load_checkpoint(filepath="./ckpts/flickr_model_no_stage_no_prune.pth", model=projection_model)
+        checkpoint = load_checkpoint(filepath="./ckpts/flickr_model_staging.pth", model=projection_model)
         projection_model.eval()
         projection_model = projection_model.to(device)
         labels = []
         z1s, z2s, z1m, z2m = [], [], [], []
         phi_1, phi_2 = [], []
+        random_sample = random.randint(0, 1000)
+        captions_all, images_all = [], []
         with torch.no_grad():
-            for batch in test_dataloader:
+            count = 0
+            for i, batch in enumerate(test_dataloader):
                 image_feats, h2, x1, captions, label = batch
                 # Generate random binary labels for each item in batch
                 lang_idx = torch.randint(0, 2, (len(x1),))
@@ -288,6 +292,12 @@ def main():
                 ).squeeze(1)
                 captions = [captions[0][i] if idx == 0 else captions[1][i] for i, idx in enumerate(lang_idx)]
                 label = lang_idx
+
+                if (count+len(batch[0])) > random_sample:
+                    random_image = x1[random_sample-count]
+                    random_caption = captions[random_sample-count]
+                else:
+                    count += len(batch[0])
 
                 # Randomly choose language (0=English, 1=French)
                 # lang_idx = random.randint(0, 1)
@@ -329,6 +339,8 @@ def main():
                 z2s.append(torch.Tensor(z_n[1][1]))
                 z1m.append(torch.Tensor(z_n[0][0]))
                 z2m.append(torch.Tensor(z_n[1][0]))
+                captions_all.append(captions)
+                images_all.append(x1)
                 labels.append(label)
                 phi_1.append(phis[0])
                 phi_2.append(phis[1])
@@ -339,6 +351,69 @@ def main():
             labels = torch.cat(labels, dim=0).unsqueeze(-1)
             phi_1 = torch.cat(phi_1, dim=0)
             phi_2 = torch.cat(phi_2, dim=0)
+            captions_all = np.concatenate(captions_all, axis=0)
+            images_all = np.concatenate([img.cpu().numpy() for img in images_all], axis=0)
+            random_caption = captions_all[random_sample]
+            random_image = images_all[random_sample]
+    print(">>>>>>>", random_caption)
+    
+    # Find 5 closest samples to z_s2[random_sample] using cosine similarity
+    similarities = torch.nn.functional.cosine_similarity(z2s[random_sample].unsqueeze(0), z2s, dim=1)
+    closest_indices = torch.topk(similarities, k=5).indices
+    print("Closest samples in shared space:", closest_indices.tolist())
+    for ind in closest_indices:
+        print(captions_all[ind])
+    similarities = torch.nn.functional.cosine_similarity(z2m[random_sample].unsqueeze(0), z2m, dim=1)
+    closest_indices = torch.topk(similarities, k=5).indices
+    print("Closest samples in modality-specific space:", closest_indices.tolist())
+    for ind in closest_indices:
+        print(captions_all[ind])
+    similarities = torch.nn.functional.cosine_similarity(z1m[random_sample].unsqueeze(0), z1m, dim=1)
+    closest_indices = torch.topk(similarities, k=5).indices
+    print("Closest samples in modality-specific space:", closest_indices.tolist())
+    # Create figure with subplots
+    fig, axes = plt.subplots(1, 6, figsize=(20, 4))
+    # Plot reference image
+    ref_img = np.transpose(images_all[random_sample], (1, 2, 0))
+    ref_img = (ref_img * 0.5) + 0.5  # Denormalize
+    axes[0].imshow(ref_img)
+    axes[0].set_title('Reference Image')
+    axes[0].axis('off')
+    # Plot closest images
+    for i, idx in enumerate(closest_indices):
+        img = np.transpose(images_all[idx], (1, 2, 0))
+        img = (img * 0.5) + 0.5  # Denormalize
+        axes[i+1].imshow(img)
+        axes[i+1].set_title(f'Match {i+1}')
+        axes[i+1].axis('off')
+    plt.tight_layout()
+    plt.savefig('./plots/closest_images_modality_specific.png')
+    plt.close()
+
+    # Create figure with subplots
+    similarities = torch.nn.functional.cosine_similarity(z1s[random_sample].unsqueeze(0), z1s, dim=1)
+    closest_indices = torch.topk(similarities, k=5).indices
+    print("Closest samples in sharedspace:", closest_indices.tolist())
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(1, 6, figsize=(20, 4))
+    # Plot reference image
+    ref_img = np.transpose(images_all[random_sample], (1, 2, 0))
+    ref_img = (ref_img * 0.5) + 0.5  # Denormalize
+    axes[0].imshow(ref_img)
+    axes[0].set_title('Reference Image')
+    axes[0].axis('off')
+    # Plot closest images
+    for i, idx in enumerate(closest_indices):
+        img = np.transpose(images_all[idx], (1, 2, 0))
+        img = (img * 0.5) + 0.5  # Denormalize
+        axes[i+1].imshow(img)
+        axes[i+1].set_title(f'Match {i+1}')
+        axes[i+1].axis('off')
+    plt.tight_layout()
+    plt.savefig('./plots/closest_shared_space.png')
+    plt.close()
+
     # Evaluate and plot
     # print(z1s.shape, z2s.shape, z1m.shape, z2m.shape)
     plot_projection_matrices(projection_model)

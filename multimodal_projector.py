@@ -287,8 +287,9 @@ class MultiLoReFT(nn.Module):
         return val_total_loss / len(val_dataloader)
 
 
-    def train_projection(self, dataloader, val_dataloader, early_stopping_config, lr=1e-3, epochs=100, save_path="./ckpts/projection_module.pth"):
+    def train_projection(self, dataloader, val_dataloader, early_stopping_config, lr=1e-3, epochs=100, exp_name="projection_module"):#save_path="./ckpts/projection_module.pth"):
         """Train the projection model with early stopping."""
+        save_path='./ckpts/%s.pth'%(exp_name)
         print(f"Training on device: {self.device}")
         print(f"Model is on device: {next(self.parameters()).device}")
         # Initialize loss tracking
@@ -416,7 +417,7 @@ class MultiLoReFT(nn.Module):
         
         # Plot final losses
         all_epoch_losses = np.array(all_epoch_losses)
-        plot_losses(all_epoch_losses, loss_names=all_loss_names, save_path="./plots/loss_curves.pdf")
+        plot_losses(all_epoch_losses, loss_names=all_loss_names, save_path="./plots/%s_loss_curves.pdf"%(exp_name), log_path="./logs/%s_loss_curves.csv"%(exp_name))
         self.save_checkpoint(optimizer, epoch, loss, filepath=save_path)
 
 

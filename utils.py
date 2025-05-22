@@ -107,8 +107,8 @@ class SklearnTrainer:
         mean_score = np.mean(all_scores)
         return mean_score, np.var(all_scores)
     
-def plot_losses(losses, loss_names, save_path=None):
-    """Plot loss curves in separate horizontal subplots."""
+def plot_losses(losses, loss_names, save_path=None, log_path=None):
+    """Plot loss curves in separate horizontal subplots and save loss values."""
     # Convert losses to numpy array if it's not already
     losses = np.array(losses)
     
@@ -137,8 +137,15 @@ def plot_losses(losses, loss_names, save_path=None):
     plt.tight_layout()
     
     if save_path:
+        # Save plot
         plt.savefig(save_path)
         plt.close()
+        
+        # Save loss values to CSV
+        csv_path = log_path
+        import pandas as pd
+        df = pd.DataFrame(all_losses, columns=all_names)
+        df.to_csv(csv_path, index_label='epoch')
     else:
         plt.show()
 
