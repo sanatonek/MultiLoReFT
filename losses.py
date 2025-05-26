@@ -33,7 +33,7 @@ class GradientNormalizedLoss:
         self.running_losses = torch.zeros(num_losses)
         self.running_count = 0
     
-    def __call__(self, losses, model, trainable_params):
+    def __call__(self, losses, trainable_params):
         """
         Compute gradient-normalized loss weights.
         
@@ -51,7 +51,7 @@ class GradientNormalizedLoss:
         # Compute gradients for each loss
         grads = []
         for loss in losses:
-            model.zero_grad()
+        #     model.zero_grad()
             loss.backward(retain_graph=True)
             
             # Collect gradients for trainable parameters
@@ -69,6 +69,11 @@ class GradientNormalizedLoss:
         # Normalize gradients and compute weights
         grad_norms = [torch.norm(g) for g in grads]
         weights = [1.0 / (norm + 1e-8) for norm in grad_norms]
+
+        # Normalize weights so they sum to 1
+        weights = torch.tensor(weights)
+        weights = weights / weights.sum()
+
         weighted_loss = sum(w * l for w, l in zip(weights, losses))
         
         return weighted_loss, weights
@@ -201,10 +206,27 @@ def loss_orthogonality(R_s, R_m1, R_m2):
     """
     Ensure orthogonality between shared and modality-specific spaces.
     """
-    loss_ortho_1 = torch.norm(torch.mm(R_s, R_m1.T), p="fro")**2
-    loss_ortho_2 = torch.norm(torch.mm(R_m1, R_m2.T), p="fro")**2
-    loss_ortho_3 = torch.norm(torch.mm(R_s, R_m2.T), p="fro")**2
-    return loss_ortho_1 + loss_ortho_2 + loss_ortho_3
+    # loss_ortho_1 = torch.norm(torch.mm(R_s, R_m1.T), p="fro")**2/ R_s.numel()
+    # loss_ortho_2 = torch.norm(torch.mm(R_m1, R_m2.T), p="fro")**2/ R_m1.numel()
+    # loss_ortho_3 = torch.norm(torch.mm(R_s, R_m2.T), p="fro")**2/ R_s.numel()
+    # return loss_ortho_1 + loss_ortho_2 + loss_ortho_3
+    def safe_normalize(x):
+        return x / (x.norm(dim=-1, keepdim=True) + 1e-8)
+
+    R_s = safe_normalize(R_s)
+    R_m1 = safe_normalize(R_m1)
+    R_m2 = safe_normalize(R_m2)
+
+    # Use mean of squared cosine similarities instead of Frobenius norm directly
+    def ortho_pair(A, B):
+        prod = torch.mm(A, B.T)
+        return (prod ** 2).mean()
+
+    loss_ortho_1 = ortho_pair(R_s, R_m1)
+    loss_ortho_2 = ortho_pair(R_m1, R_m2)
+    loss_ortho_3 = ortho_pair(R_s, R_m2)
+
+    return (loss_ortho_1 + loss_ortho_2 + loss_ortho_3)
 
 def loss_shared_consistency(z_s1, z_s2):
     """
@@ -234,36 +256,3 @@ def loss_reconstruction_m(x, z, decoder):
 
 def loss_reconstruction_m(x, z, decoder):
     """Compute reconstruction loss between input and decoded representation."""
-def compute_stage_losses(model, h1, h2, z_components, stage):
-    """
-    Compute losses based on the current training stage.
-    
-    Args:
-        model: The projection model
-        h1, h2: Input representations
-        z_components: Decomposed representations
-        stage: Current training stage ("shared", "private", or "joint")
-        
-    Returns:
-        losses_list: List of losses to optimize
-        loss_names: Names of the losses
-        all_losses: All computed losses
-        all_loss_names: Names of all losses
-    """
-    # Compute all losses
-    l_shared = loss_shared_consistency(z_components[0][1], z_components[1][1])
-    l_orthogonal = loss_orthogonality(model.R_s, model.R_m1, model.R_m2)
-    l_mi = loss_mutual_info(h1, h2, z_components)
-    
-    all_losses = [l_shared.item(), l_orthogonal.item(), l_mi.item()]
-    all_loss_names = ["Shared Loss", "Orthogonal Loss", "Mutual Info Loss"]
-    
-    # Return appropriate losses based on stage
-    if stage == "shared":
-        return [l_shared, l_mi], ["Shared Loss", "Mutual Info Loss"], all_losses, all_loss_names
-    elif stage == "private":
-        return [l_orthogonal], ["Orthogonal Loss"], all_losses, all_loss_names
-    elif stage == "joint":
-        return [l_orthogonal, l_shared, l_mi], ["Orthogonal Loss", "Shared Loss", "Mutual Info Loss"], all_losses, all_loss_names
-    else:
-        raise ValueError(f"Unknown training stage: {stage}")

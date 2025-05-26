@@ -7,9 +7,55 @@ from torch.utils.data import Dataset, DataLoader
 from utils import *
 import numpy as np
 from multimodal_projector import *
-from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge, Lasso
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+# from flickr import Multi30KMixedLangDataset
+from sklearn.metrics import r2_score, accuracy_score
+# import clip
+# import timm
+# from torchvision import transforms
+# from transformers import BertTokenizer, BertModel
+# from transformers import AutoTokenizer, AutoModel
 
+
+def evaluate_cross_modal_retrieval(phis0, phis1, projector, device):
+    """
+    Evaluates cross-modal retrieval performance using cosine similarity.
+
+    Assumes:
+    - dataloader yields (h1, h2, x1, x2, l)
+    - projector(h1, h2) -> (phi1, phi2)
+    - h1: features from modality 1 (e.g., image)
+    - h2: features from modality 2 (e.g., text)
+
+    Returns:
+        dict with Recall@1, Recall@5, Recall@10 for both directions
+    """
+
+    # Compute similarity matrix
+    sim_matrix = phis0 @ phis1.T  # (N x N)
+
+    def recall_at_k(sim_matrix, k, labels):
+        topk = sim_matrix.topk(k, dim=1).indices
+        
+        # For each query i, its true match is at index i
+        # Create a column vector of indices [0,1,2,...,N-1]
+        true_matches = torch.arange(sim_matrix.shape[0], device=sim_matrix.device).unsqueeze(1)
+        
+        # Check if true matching index appears in top k predictions
+        correct = (topk == true_matches).any(dim=1).float()
+        return correct.mean().item()
+
+    results = {
+        'Image→Text R@1': recall_at_k(sim_matrix, 1, labels),
+        'Image→Text R@5': recall_at_k(sim_matrix, 5, labels),
+        'Image→Text R@10': recall_at_k(sim_matrix, 10, labels),
+        'Text→Image R@1': recall_at_k(sim_matrix.T, 1, labels),
+        'Text→Image R@5': recall_at_k(sim_matrix.T, 5, labels),
+        'Text→Image R@10': recall_at_k(sim_matrix.T, 10, labels),
+    }
+
+    return results
 
 def evaluate_predictability(z_n, labels, label_idx):
     """Evaluate how well each component (shared and modality-specific) can predict the target label.
@@ -21,14 +67,15 @@ def evaluate_predictability(z_n, labels, label_idx):
     """
     print(f'Predictability for label {label_idx}')
     components = [
-        ("Zs1", z_n[0][1]),  # Shared representation from modality 1
-        ("Zs2", z_n[1][1]),  # Shared representation from modality 2
-        ("Zm1", z_n[0][0]),  # Modality-specific representation from modality 1
-        ("Zm2", z_n[1][0])   # Modality-specific representation from modality 2
+        ("Zs1", z_n[1]),  # Shared representation from modality 1
+        ("Zs2", z_n[3]),  # Shared representation from modality 2
+        ("Zm1", z_n[0]),  # Modality-specific representation from modality 1
+        ("Zm2", z_n[2])   # Modality-specific representation from modality 2
     ] 
     
     # Determine if this is a classification or regression task
     y = labels[:,label_idx]
+    y = y.detach().cpu().numpy() if hasattr(y, "detach") else np.array(y)
     unique_values = np.unique(y)
     n_unique = len(unique_values)
     
@@ -43,12 +90,15 @@ def evaluate_predictability(z_n, labels, label_idx):
     
     if is_classification:
         print(f"Task type: Classification ({n_unique} classes)")
-        model = LogisticRegression(max_iter=500)
+        # model = LogisticRegression(max_iter=100)
+        # model = Ridge(alpha=1.0)
+        model = Lasso(alpha=0.1)
         task_type = "classification"
         metric_name = "accuracy"
     else:
         print(f"Task type: Regression ({n_unique} unique values)")
-        model = LinearRegression()
+        # model = LinearRegression()
+        model = Lasso(alpha=0.1)
         task_type = "regression"
         metric_name = "R2 score"
     
@@ -70,7 +120,8 @@ def plot_representations(z_n, labels, save_dir="./plots"):
         labels: Target labels
         save_dir: Directory to save the plots
     """
-    for l_ind in range(labels.shape[1]):
+    print(labels.shape)
+    for l_ind in range(len(labels[0])):
         fig, axs = plt.subplots(2, 2, figsize=(16, 16))    
         titles = [
             ('Modality-specific A', 0, 0),
@@ -82,17 +133,17 @@ def plot_representations(z_n, labels, save_dir="./plots"):
         for title, i, j in titles:
             ax = axs[i, j]
             ax.set_title(title)     
-            data = z_n[i][j].detach().cpu().numpy()
+            data = z_n[i*2+j].detach().cpu().numpy()
             
             if data.shape[1] >= 2:
                 # Normal PCA case (2+ dimensions)
                 pca = PCA(n_components=2)
                 x = pca.fit_transform(data)
-                ax.scatter(x[:, 0], x[:, 1], c=labels[:, l_ind])
+                ax.scatter(x[:, 0], x[:, 1], c=labels[:, l_ind])#.cpu().numpy())
             elif data.shape[1] == 1:
                 # Handle 1D case by adding a zero column for visualization
                 x = np.hstack([data, np.zeros_like(data)])
-                ax.scatter(x[:, 0], x[:, 1], c=labels[:, l_ind])
+                ax.scatter(x[:, 0], x[:, 1], c=labels[:, l_ind])#.cpu().numpy())
             else:
                 # If no valid features, just write "No Data"
                 ax.text(0.5, 0.5, "No Data", horizontalalignment='center', verticalalignment='center')
@@ -172,35 +223,209 @@ def plot_projection_matrices(model, threshold=0.00, save_dir="./plots"):
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dataset_name = "simulated_data"
     
-    # Load and prepare data
-    loaded_data = np.load("./data/simulated_data.npz")
-    h1 = loaded_data["h1"]
-    h2 = loaded_data["h2"]
-    x1 = loaded_data["x1"]
-    x2 = loaded_data["x2"]
-    labels = loaded_data["labels"][3000:]
+    if dataset_name=="simulated_data":
+        # Load and prepare data
+        loaded_data = np.load("./data/simulated_data.npz")
+        h1 = loaded_data["h1"]
+        h2 = loaded_data["h2"]
+        x1 = loaded_data["x1"]
+        x2 = loaded_data["x2"]
+        labels = loaded_data["labels"][3000:]
+        # Create dataset
+        dataset = MultimodalDataset(h1[3000:], h2[3000:], x1[3000:], x2[3000:], labels)  
+        # Load model
+        # Initialize model
+        projection_model = MultiLoReFT(
+            input_dims=[5,5], 
+            shared_rank=4, 
+            specific_rank=4, 
+            staging=True,
+            pruning=True,
+            device=device
+        ).to(device)
+        # projection_model = ProjectionModule(input_dims=[5,5], shared_rank=4, specific_rank=4, data_dim={'A':5, 'B':6}).to(device)
+        checkpoint = load_checkpoint(filepath="./ckpts/projection_module.pth", model=projection_model)
+        projection_model.eval()
+        projection_model = projection_model.to(device)
+        # Get representations
+        h1 = F.normalize(torch.Tensor(dataset.h1).float(), dim=1).to(device)
+        h2 = F.normalize(torch.Tensor(dataset.h2).float(), dim=1).to(device)
+        phis = projection_model([h1,h2])
+        z_n = projection_model.decouple(phis, full=True, th=0.05)
+        (z1m, z1s, z2m, z2s) = z_n[0][0], z_n[0][1], z_n[1][0], z_n[1][1]
+        phi_1, phi_2 = phis[0], phis[1]
     
-    # Create dataset
-    dataset = MultimodalDataset(h1[3000:], h2[3000:], x1[3000:], x2[3000:], labels)
+    if dataset_name=="flickr":
+        # Load CLIP (English only)
+        clip_model, clip_preprocess = clip.load("ViT-B/32", device=device)
+        clip_model.eval()
+        test_dataset = Multi30KMixedLangDataset(split="test", device=device)
+        test_dataloader = DataLoader(test_dataset, batch_size=256, shuffle=False)
+        # image_encoder = timm.create_model('vit_base_patch14_dinov2', pretrained=True)
+        # english_encoder = BertModel.from_pretrained('bert-base-uncased').to(device)
+        # french_encoder = AutoModel.from_pretrained("sentence-transformers/LaBSE").to(device)
+        projection_model = MultiLoReFT(
+                                    input_dims=[768,768], 
+                                    shared_rank=128, 
+                                    specific_rank=128, 
+                                    device=device
+                                ).to(device)
+                                
+        # checkpoint = load_checkpoint(filepath="./ckpts/flickr_model_no_stage_no_prune.pth", model=projection_model)
+        checkpoint = load_checkpoint(filepath="./ckpts/flickr_model_staging.pth", model=projection_model)
+        projection_model.eval()
+        projection_model = projection_model.to(device)
+        labels = []
+        z1s, z2s, z1m, z2m = [], [], [], []
+        phi_1, phi_2 = [], []
+        random_sample = random.randint(0, 1000)
+        captions_all, images_all = [], []
+        with torch.no_grad():
+            count = 0
+            for i, batch in enumerate(test_dataloader):
+                image_feats, h2, x1, captions, label = batch
+                # Generate random binary labels for each item in batch
+                lang_idx = torch.randint(0, 2, (len(x1),))
+                # Use the labels to select language for each item
+                lang_idx = lang_idx.to(device)
+                text_feats = torch.stack([h2[0], h2[1]], dim=1).gather(
+                    1, lang_idx.unsqueeze(1).unsqueeze(2).expand(-1, -1, h2[0].shape[-1])
+                ).squeeze(1)
+                captions = [captions[0][i] if idx == 0 else captions[1][i] for i, idx in enumerate(lang_idx)]
+                label = lang_idx
+
+                if (count+len(batch[0])) > random_sample:
+                    random_image = x1[random_sample-count]
+                    random_caption = captions[random_sample-count]
+                else:
+                    count += len(batch[0])
+
+                # Randomly choose language (0=English, 1=French)
+                # lang_idx = random.randint(0, 1)
+                # text_feats = text_feats[lang_idx]
+                # captions = captions[lang_idx]
+                # projection_model.encoders[0] = projection_model.encoders[0].to(device)
+                # projection_model.encoders[1] = projection_model.encoders[1].to(device)
+                # projection_model.encoders[2] = projection_model.encoders[2].to(device)
+                # projection_model.encoders[0].eval()
+                # projection_model.encoders[1].eval()
+                # projection_model.encoders[2].eval()
+
+                # preprocess = get_dino_preprocess()
+                # image = (x1).to(device)
+                # tokens_en = BertTokenizer.from_pretrained('bert-base-uncased')(x2, return_tensors="pt", padding=True, truncation=True).to(device)
+                # tokens_fr = AutoTokenizer.from_pretrained("sentence-transformers/LaBSE")(x2, padding=True, truncation=True, return_tensors="pt").to(device)
+                # with torch.no_grad():
+                    # model_output = projection_model.encoders[2](**tokens_fr)
+                    # embeddings_fr = model_output.last_hidden_state[:, 0, :].to(device)
+                
+                    # model_output = projection_model.encoders[1](**tokens_en)
+                    # embeddings_en = model_output.last_hidden_state[:, 0, :].to(device)
+                    
+                    # image_feats = projection_model.encoders[0].forward_features(image)[:, 0, :].to(device)
+                    # text_feats = torch.where(label.unsqueeze(1).expand(-1, embeddings_en.size(1)) == 0, embeddings_en, embeddings_fr)
+                    # captions = x2
+                # image_feats, text_feats, images, captions, label = batch
+                # image_feats = image_feats.to(device)
+                # text_feats = text_feats.to(device)
+                
+                # image_transformed = clip_preprocess(image).to(device)  # (3, H, W)
+                # image_feat_clip = clip_model.encode_image(image_transformed.unsqueeze(0)).squeeze(0).to(torch.float32)
+                # tokens = clip.tokenize([caption_en]).to(device)
+                # text_feat_clip = clip_model.encode_text(tokens).squeeze(0).to(torch.float32)
+                
+                phis = projection_model([image_feats, text_feats])
+                z_n = projection_model.decouple(phis, full=True)
+                z1s.append(torch.Tensor(z_n[0][1]))
+                z2s.append(torch.Tensor(z_n[1][1]))
+                z1m.append(torch.Tensor(z_n[0][0]))
+                z2m.append(torch.Tensor(z_n[1][0]))
+                captions_all.append(captions)
+                images_all.append(x1)
+                labels.append(label)
+                phi_1.append(phis[0])
+                phi_2.append(phis[1])
+            z1s = torch.cat(z1s, dim=0)
+            z2s = torch.cat(z2s, dim=0)
+            z1m = torch.cat(z1m, dim=0)
+            z2m = torch.cat(z2m, dim=0)
+            labels = torch.cat(labels, dim=0).unsqueeze(-1)
+            phi_1 = torch.cat(phi_1, dim=0)
+            phi_2 = torch.cat(phi_2, dim=0)
+            captions_all = np.concatenate(captions_all, axis=0)
+            images_all = np.concatenate([img.cpu().numpy() for img in images_all], axis=0)
+            random_caption = captions_all[random_sample]
+            random_image = images_all[random_sample]
+        print(">>>>>>>", random_caption)
     
-    # Load model
-    projection_model = ProjectionModule(input_dims=[5,5], shared_rank=4, specific_rank=4, data_dim={'A':5, 'B':6}).to(device)
-    checkpoint = load_checkpoint(filepath="./ckpts/projection_module.pth", model=projection_model)
-    
-    # Get representations
-    h1 = F.normalize(torch.Tensor(dataset.h1).float(), dim=1).to(device)
-    h2 = F.normalize(torch.Tensor(dataset.h2).float(), dim=1).to(device)
-    phis = projection_model([h1,h2])
-    z_n = projection_model.decouple(phis, full=True, th=0.05)
-    
+        # Find 5 closest samples to z_s2[random_sample] using cosine similarity
+        similarities = torch.nn.functional.cosine_similarity(z2s[random_sample].unsqueeze(0), z2s, dim=1)
+        closest_indices = torch.topk(similarities, k=5).indices
+        print("Closest samples in shared space:", closest_indices.tolist())
+        for ind in closest_indices:
+            print(captions_all[ind])
+        similarities = torch.nn.functional.cosine_similarity(z2m[random_sample].unsqueeze(0), z2m, dim=1)
+        closest_indices = torch.topk(similarities, k=5).indices
+        print("Closest samples in modality-specific space:", closest_indices.tolist())
+        for ind in closest_indices:
+            print(captions_all[ind])
+        similarities = torch.nn.functional.cosine_similarity(z1m[random_sample].unsqueeze(0), z1m, dim=1)
+        closest_indices = torch.topk(similarities, k=5).indices
+        print("Closest samples in modality-specific space:", closest_indices.tolist())
+        # Create figure with subplots
+        fig, axes = plt.subplots(1, 6, figsize=(20, 4))
+        # Plot reference image
+        ref_img = np.transpose(images_all[random_sample], (1, 2, 0))
+        ref_img = (ref_img * 0.5) + 0.5  # Denormalize
+        axes[0].imshow(ref_img)
+        axes[0].set_title('Reference Image')
+        axes[0].axis('off')
+        # Plot closest images
+        for i, idx in enumerate(closest_indices):
+            img = np.transpose(images_all[idx], (1, 2, 0))
+            img = (img * 0.5) + 0.5  # Denormalize
+            axes[i+1].imshow(img)
+            axes[i+1].set_title(f'Match {i+1}')
+            axes[i+1].axis('off')
+        plt.tight_layout()
+        plt.savefig('./plots/closest_images_modality_specific.png')
+        plt.close()
+
+        # Create figure with subplots
+        similarities = torch.nn.functional.cosine_similarity(z1s[random_sample].unsqueeze(0), z1s, dim=1)
+        closest_indices = torch.topk(similarities, k=5).indices
+        print("Closest samples in sharedspace:", closest_indices.tolist())
+        
+        # Create figure with subplots
+        fig, axes = plt.subplots(1, 6, figsize=(20, 4))
+        # Plot reference image
+        ref_img = np.transpose(images_all[random_sample], (1, 2, 0))
+        ref_img = (ref_img * 0.5) + 0.5  # Denormalize
+        axes[0].imshow(ref_img)
+        axes[0].set_title('Reference Image')
+        axes[0].axis('off')
+        # Plot closest images
+        for i, idx in enumerate(closest_indices):
+            img = np.transpose(images_all[idx], (1, 2, 0))
+            img = (img * 0.5) + 0.5  # Denormalize
+            axes[i+1].imshow(img)
+            axes[i+1].set_title(f'Match {i+1}')
+            axes[i+1].axis('off')
+        plt.tight_layout()
+        plt.savefig('./plots/closest_shared_space.png')
+        plt.close()
+
     # Evaluate and plot
+    # print(z1s.shape, z2s.shape, z1m.shape, z2m.shape)
     plot_projection_matrices(projection_model)
-    plot_representations(z_n, labels)
+    plot_representations((z1m, z1s, z2m, z2s), labels)
+    for label_idx in range(labels.shape[1]):
+        evaluate_predictability((z1m, z1s, z2m, z2s), labels, label_idx)
+    evaluate_cross_modal_retrieval(phi_1, phi_2, projector=projection_model, device=device, labels=labels)
     
     # Evaluate predictability for each label
-    for label_idx in range(labels.shape[1]):
-        evaluate_predictability(z_n, labels, label_idx)
 
 
 if __name__=="__main__":
