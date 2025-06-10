@@ -9,13 +9,13 @@ import numpy as np
 from multimodal_projector import *
 from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge, Lasso
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-# from flickr import Multi30KMixedLangDataset
+from flickr import Multi30KMixedLangDataset
 from sklearn.metrics import r2_score, accuracy_score
-# import clip
-# import timm
-# from torchvision import transforms
-# from transformers import BertTokenizer, BertModel
-# from transformers import AutoTokenizer, AutoModel
+import clip
+import timm
+from torchvision import transforms
+from transformers import BertTokenizer, BertModel
+from transformers import AutoTokenizer, AutoModel
 
 
 def evaluate_cross_modal_retrieval(phis0, phis1, projector, device):
@@ -223,9 +223,9 @@ def plot_projection_matrices(model, threshold=0.00, save_dir="./plots"):
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset_name = "simulated_data"
+    dataset_name = "simulated"
     
-    if dataset_name=="simulated_data":
+    if dataset_name=="simulated":
         # Load and prepare data
         loaded_data = np.load("./data/simulated_data.npz")
         h1 = loaded_data["h1"]

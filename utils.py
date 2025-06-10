@@ -107,7 +107,7 @@ class SklearnTrainer:
         mean_score = np.mean(all_scores)
         return mean_score, np.var(all_scores)
     
-def plot_losses(losses, loss_names, save_path=None, log_path=None):
+def plot_losses(losses, loss_names, save_path=None, log_path=None, stage_switches=None):
     """Plot loss curves in separate horizontal subplots and save loss values."""
     # Convert losses to numpy array if it's not already
     losses = np.array(losses)
@@ -133,6 +133,9 @@ def plot_losses(losses, loss_names, save_path=None, log_path=None):
         ax.set_title(name)
         ax.legend()
         ax.grid(True)
+        if stage_switches:
+            for stage, epoch in stage_switches:
+                ax.axvline(x=epoch, color='red', linestyle='--', label='Stage Switch')
     
     plt.tight_layout()
     

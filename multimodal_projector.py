@@ -8,10 +8,10 @@ from sim_data import generate_multimodal_data
 from utils import *
 from losses import *
 import random
-# from transformers import BertTokenizer, AutoTokenizer
-# from torch.cuda.amp import autocast
+import os
+from transformers import BertTokenizer, AutoTokenizer
+from torch.cuda.amp import autocast
 
-DATASET="simulated"
 
 class MultimodalDataset(Dataset):
     """Dataset class for multimodal data."""
@@ -31,13 +31,15 @@ class MultimodalDataset(Dataset):
 
 class MultiLoReFT(nn.Module):
     """LoReFT module for multimodal projection learning."""
-    def __init__(self, input_dims, shared_rank, specific_rank, staging=True, encoders=None, pruning_threshold=0.05, pruning=True, device=None):
+    def __init__(self, input_dims, shared_rank, specific_rank, staging=True, encoders=None, 
+                pruning_threshold=0.05, pruning=True, device=None, dataset_name="simulated"):
         super(MultiLoReFT, self).__init__()
         self.shared_rank = shared_rank
         self.specific_rank = specific_rank
         self.pruning_threshold = pruning_threshold
         self.pruned = False
         self.encoders = encoders
+        self.dataset_name = dataset_name
         if encoders is not None:
             for i in range(len(encoders)):
                 self.encoders[i] = encoders[i].to(device)
@@ -51,9 +53,11 @@ class MultiLoReFT(nn.Module):
             self.trainable_stage = "joint"
         self.stage_tracking = {
                 "best_val_loss": 5000,
+                "best_val_MI_loss": 5000,
                 "plateau_counter": 0,
                 "min_epochs_counter": 0,
             }
+        self.stage_switches = []
         
         # Initialize projection matrices
         self.R_s = nn.Parameter(torch.randn(shared_rank, max(input_dims[0], input_dims[1]), dtype=torch.float32))
@@ -100,9 +104,9 @@ class MultiLoReFT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
     
     def _orthogonal_init(self):
-        nn.init.orthogonal_(self.R_s)
-        nn.init.orthogonal_(self.R_m1)
-        nn.init.orthogonal_(self.R_m2)
+        nn.init.orthogonal_(self.R_s, gain=0.1)
+        nn.init.orthogonal_(self.R_m1, gain=0.1)
+        nn.init.orthogonal_(self.R_m2, gain=0.1)
     
     def get_trainable_parameters(self):
         """Get parameters to train based on current stage."""
@@ -258,11 +262,13 @@ class MultiLoReFT(nn.Module):
     def evaluate_validation_loss(self, val_dataloader):
         """Evaluate model on validation set."""
         val_total_loss = 0
+        val_loss_list = [0]*3  # Initialize list to store losses
         self.eval()
+        loss_balancer = GradientNormalizedLoss(num_losses=3)
         with torch.no_grad():
             for val_batch in val_dataloader:
                 if self.encoders is not None:
-                    x1, x2, label = batch
+                    x1, x2, label = val_batch
                     label = label.to(self.device)
                     x1 = (x1).to(self.device)
                     x2 = (x2).to(self.device)
@@ -278,7 +284,7 @@ class MultiLoReFT(nn.Module):
                         h2 = torch.where(label.unsqueeze(1).expand(-1, embeddings_en.size(1)) == 0, embeddings_en, embeddings_fr)
                 else:
                     h1, h2, x1, x2, label = val_batch
-                    if DATASET == "flickr":
+                    if self.dataset_name == "flickr":
                         # Generate random binary labels for each item in batch
                         lang_idx = torch.randint(0, 2, (len(h1),), device=self.device)
                         # Use the labels to select language for each item
@@ -291,15 +297,28 @@ class MultiLoReFT(nn.Module):
                 phis = self.forward([h1, h2])
                 
                 z_components = self.decouple(phis, full=True)
-                losses_list, _, _, _ = self.compute_stage_losses(h1, h2, z_components)
+                losses_list, _, all_losses_list, _ = self.compute_stage_losses(h1, h2, z_components)
                 val_loss = torch.stack(losses_list).mean()
+                # val_loss, weights = loss_balancer(torch.stack(losses_list), self.get_trainable_parameters())
+
                 val_total_loss += val_loss.item()
+                # Return both total loss and average loss list
+                for i, loss in enumerate(all_losses_list):
+                    val_loss_list[i] += loss
         self.train()
-        return val_total_loss / len(val_dataloader)
+        
+        # Average the losses over batches
+        val_loss_list = [loss / len(val_dataloader) for loss in val_loss_list]
+        
+        return val_total_loss / len(val_dataloader), val_loss_list
 
 
     def train_projection(self, dataloader, val_dataloader, early_stopping_config, lr=1e-3, epochs=100, exp_name="projection_module"):#save_path="./ckpts/projection_module.pth"):
         """Train the projection model with early stopping."""
+        # Create checkpoints directory if it doesn't exist
+        os.makedirs("./ckpts", exist_ok=True)
+        os.makedirs("./plots", exist_ok=True)
+        os.makedirs("./logs", exist_ok=True)
         save_path='./ckpts/%s.pth'%(exp_name)
         print(f"Training on device: {self.device}")
         print(f"Model is on device: {next(self.parameters()).device}")
@@ -333,7 +352,7 @@ class MultiLoReFT(nn.Module):
                         h2 = torch.where(label.unsqueeze(1).expand(-1, embeddings_en.size(1)) == 0, embeddings_en, embeddings_fr)
                 else:
                     h1, h2, x1, x2, label = batch
-                    if DATASET == "flickr":
+                    if self.dataset_name == "flickr":
                         # Generate random binary labels for each item in batch
                         lang_idx = torch.randint(0, 2, (len(h1),), device=self.device)
                         # Use the labels to select language for each item
@@ -363,10 +382,10 @@ class MultiLoReFT(nn.Module):
             all_epoch_losses.append(epoch_losses)
             scheduler.step()
             
-            val_loss = self.evaluate_validation_loss(val_dataloader)
+            val_loss, val_loss_list = self.evaluate_validation_loss(val_dataloader)
             if self.pruning:
                 # Prune if in joint stage
-                if self.trainable_stage == "joint" and val_loss <= self.stage_tracking['best_val_loss'] and epoch>40:  # Index 2 is MI loss based on all_loss_names
+                if self.trainable_stage == "joint" and (val_loss_list[2] <= self.stage_tracking['best_val_MI_loss'] * 1.05) and epoch>40:  # Index 2 is MI loss based on all_loss_names, allow 5% margin
                     self.prune_singular_values()
                     optimizer = self.update_optimizer(optimizer)
                     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
@@ -381,6 +400,8 @@ class MultiLoReFT(nn.Module):
                 
                 if val_loss<self.stage_tracking["best_val_loss"]:
                     self.stage_tracking["best_val_loss"] = val_loss
+                if val_loss_list[2]<self.stage_tracking["best_val_MI_loss"]:
+                    self.stage_tracking["best_val_MI_loss"] = val_loss_list[2]
                 
                 # Update tracking metrics
                 if relative_improvement > stage_config["min_improvement_ratio"]:
@@ -397,9 +418,13 @@ class MultiLoReFT(nn.Module):
                 if self.trainable_stage != "joint" and self.staging and should_switch:
                     if self.trainable_stage == "shared":
                         self.trainable_stage = "private"
+                        self.stage_switches = getattr(self, 'stage_switches', [])
+                        self.stage_switches.append(('private', epoch))
                         print(f"***** [Epoch {epoch}] → Switched to PRIVATE stage after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
                     elif self.trainable_stage == "private":
                         self.trainable_stage = "joint"
+                        self.stage_switches = getattr(self, 'stage_switches', [])
+                        self.stage_switches.append(('joint', epoch))
                         print(f"***** [Epoch {epoch}] → Switched to JOINT stage after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
                     print(f"Final {self.trainable_stage} stage loss: {val_loss:.4f}")
                     # trainable_params = self.get_trainable_parameters()
@@ -427,9 +452,8 @@ class MultiLoReFT(nn.Module):
                     f"epochs={self.stage_tracking['min_epochs_counter']}/{stage_config['max_epochs']}")
             self.save_checkpoint(optimizer, epoch, loss, filepath=save_path)
         
-        # Plot final losses
-        all_epoch_losses = np.array(all_epoch_losses)
-        plot_losses(all_epoch_losses, loss_names=all_loss_names, save_path="./plots/%s_loss_curves.pdf"%(exp_name), log_path="./logs/%s_loss_curves.csv"%(exp_name))
+            # Plot final losses
+            plot_losses(np.array(all_epoch_losses), loss_names=all_loss_names, save_path="./plots/%s_loss_curves.pdf"%(exp_name), log_path="./logs/%s_loss_curves.csv"%(exp_name), stage_switches=self.stage_switches)
         self.save_checkpoint(optimizer, epoch, loss, filepath=save_path)
 
 
@@ -447,9 +471,14 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Generate and load data
-    # h1, h2, x1, x2, labels = generate_multimodal_data(
-    #     n_samples=6000, mod_dim=5, save_path="./data/simulated_data.npz")
-    loaded_data = np.load("./data/simulated_data.npz")
+    try:
+        loaded_data = np.load("./data/simulated_data.npz")
+    except FileNotFoundError:
+        # Create data directory if it doesn't exist
+        os.makedirs("./data", exist_ok=True)
+        h1, h2, x1, x2, labels = generate_multimodal_data(
+            n_samples=6000, mod_dim=5, save_path="./data/simulated_data.npz")
+        loaded_data = np.load("./data/simulated_data.npz")
     h1, h2, x1, x2, labels = loaded_data["h1"], loaded_data["h2"], loaded_data["x1"], loaded_data["x2"], loaded_data["labels"]
     # Create datasets
     dataset = MultimodalDataset(h1[:4000], h2[:4000], x1[:4000], x2[:4000], labels[:4000])
@@ -463,19 +492,19 @@ def main():
     early_stopping_config = {
         "shared": {
             "patience": 10,
-            "min_improvement_ratio": 0.01,
+            "min_improvement_ratio": 0.001,
             # "min_epochs": 50,
             "max_epochs": 400
         },
         "private": {
             "patience": 10,
-            "min_improvement_ratio": 0.01,
+            "min_improvement_ratio": 0.001,
             # "min_epochs": 50,
             "max_epochs": 400
         },
         "joint": {
             "patience": 10,
-            "min_improvement_ratio": 0.01,
+            "min_improvement_ratio": 0.001,
             # "min_epochs": 100,
             "max_epochs": 300
         }
@@ -494,7 +523,7 @@ def main():
     
 
     # Train model
-    projection_model.train_projection(dataloader, val_dataloader, early_stopping_config, lr=1e-3, epochs=1000)
+    projection_model.train_projection(dataloader, val_dataloader, early_stopping_config, lr=1e-3, epochs=800)
 
 
 if __name__ == "__main__":

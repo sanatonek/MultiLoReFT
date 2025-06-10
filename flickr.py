@@ -2,10 +2,10 @@ import torch
 from torch.utils.data import Dataset
 from datasets import load_dataset
 from PIL import Image
-import clip
+# import clip
 import os
 import random
-from transformers import AutoTokenizer, AutoModel
+# from transformers import AutoTokenizer, AutoModel
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
@@ -27,8 +27,13 @@ def get_dino_preprocess(image_size=518):
     ])
 
 class Multi30KMixedLangDataset(Dataset):
-    def __init__(self, split='train', device='cuda', embedding_cache_dir="./data/cached_flickr_feats"):
-        self.dataset = load_dataset("romrawinjp/multi30k", split=split)
+    def __init__(self, split='train', device='cuda', embedding_cache_dir="/data/stonekab/cached_flickr_feats"):
+        # self.dataset = load_dataset("romrawinjp/multi30k", split=split)
+        self.dataset = load_dataset(
+                    "romrawinjp/multi30k",
+                    split=split,
+                    cache_dir="/data/stonekab"
+                )
         self.device = device
         self.languages = ["en", "fr"]
         self.preprocess = get_dino_preprocess()
@@ -75,7 +80,7 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # Create train/val/test splits
     train_dataset = Multi30KMixedLangDataset(split="train", device=device)
-    train_dataset = torch.utils.data.Subset(train_dataset, range(5000))
+    train_dataset = torch.utils.data.Subset(train_dataset, range(4000))
     val_dataset = Multi30KMixedLangDataset(split="validation", device=device)
     # test_dataset = Multi30KMixedLangDataset(split="test", device=device)
 
@@ -97,8 +102,9 @@ if __name__ == "__main__":
         specific_rank=128, 
         pruning_threshold=1.,
         device=device,
-        staging=False,
-        pruning=False
+        staging=True,
+        pruning=True,
+        dataset_name="flickr"
     ).to(device)
     
 
@@ -137,4 +143,4 @@ if __name__ == "__main__":
         }
     }
 
-    projection_model.train_projection(train_dataloader, val_dataloader, early_stopping_config, lr=1e-3, epochs=120, exp_name='flickr_model_no_stage_no_prune')#, save_path='./ckpts/flickr_model_staging.pth')
+    projection_model.train_projection(train_dataloader, val_dataloader, early_stopping_config, lr=1e-3, epochs=60, exp_name='flickr_model_all')#, save_path='./ckpts/flickr_model_staging.pth')
