@@ -424,6 +424,10 @@ class MultiLoReFT(nn.Module):
                     self.stage_tracking["best_val_loss"] = 5000
                     self.stage_tracking["plateau_counter"] = 0
                     self.stage_tracking["min_epochs_counter"] = 0
+                elif self.trainable_stage == "joint" and should_switch:
+                    if self.verbose:
+                        print(f"***** [Epoch {epoch}] → Early stopping after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
+                    break
                 
                 # # Update optimizer
                 # trainable_params = model.get_trainable_parameters()
