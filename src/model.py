@@ -311,6 +311,7 @@ class MultiLoReFT(nn.Module):
             # Default to cosine annealing if no valid schedule is provided
             print("No valid learning rate schedule provided, using CosineAnnealingLR.")
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
+        return scheduler
 
     def train_projection(self, dataloader, val_dataloader, early_stopping_config, hyperparameters=None, lr=1e-3, epochs=100, exp_name="projection_module"):#save_path="./ckpts/projection_module.pth"):
         """Train the projection model with early stopping."""
