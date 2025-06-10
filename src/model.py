@@ -2,14 +2,29 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import matplotlib.pyplot as plt
 from transformers import BertTokenizer, AutoTokenizer
-from src.losses import loss_shared_consistency, loss_orthogonality, loss_mutual_info
-from src.utils import GradientNormalizedLoss, plot_losses
+from src.losses import loss_shared_consistency, loss_orthogonality, loss_mutual_info, GradientNormalizedLoss
+from src.visualization import plot_losses
+from src.utils import custom_weight_init, log_wandb
+from src.eval_metrics import calc_corrs_and_ranks, evaluate_validation_loss, eval_model, reeval_model
 
 class MultiLoReFT(nn.Module):
     """LoReFT module for multimodal projection learning."""
-    def __init__(self, input_dims, shared_rank, specific_rank, staging=True, encoders=None, pruning_threshold=0.05, pruning=True, device=None, dataset_type=None):
+    def __init__(
+            self, 
+            input_dims, 
+            shared_rank, 
+            specific_rank, 
+            staging=True, 
+            encoders=None, 
+            pruning_threshold=0.05, 
+            pruning=True, 
+            r_init="uniform",
+            device=None, 
+            dataset_type=None,
+            verbose=True,
+            wandb_log=False
+        ):
         super(MultiLoReFT, self).__init__()
         self.shared_rank = shared_rank
         self.specific_rank = specific_rank
@@ -26,62 +41,67 @@ class MultiLoReFT(nn.Module):
         self.device = device
         if staging:
             self.trainable_stage = "shared"
+            self.stage_tracking = {
+                    "best_val_loss": 5000,
+                    "plateau_counter": 0,
+                    "min_epochs_counter": 0,
+                }
         else:
             self.trainable_stage = "joint"
-        self.stage_tracking = {
-                "best_val_loss": 5000,
-                "plateau_counter": 0,
-                "min_epochs_counter": 0,
-            }
+            self.stage_tracking = {
+                    "best_val_loss": 5000,
+                    "plateau_counter": 0,
+                    "min_epochs_counter": 0,
+                }
+        self.verbose = verbose
+        self.wandb_log = wandb_log
         
         # Initialize projection matrices
-        self.R_s = nn.Parameter(torch.randn(shared_rank, max(input_dims[0], input_dims[1]), dtype=torch.float32))
-        self.R_m1 = nn.Parameter(torch.randn(specific_rank, input_dims[0], dtype=torch.float32))
-        self.R_m2 = nn.Parameter(torch.randn(specific_rank, input_dims[1], dtype=torch.float32))
+        self.R_s = nn.Parameter(torch.empty(shared_rank, max(input_dims[0], input_dims[1]), dtype=torch.float32))
+        self.R_m1 = nn.Parameter(torch.empty(specific_rank, input_dims[0], dtype=torch.float32))
+        self.R_m2 = nn.Parameter(torch.empty(specific_rank, input_dims[1], dtype=torch.float32))
         # Initialize weights
-        self._orthogonal_init()
+        self._orthogonal_init(r_init)
         # Create weight networks for each modality
-        self._create_weight_networks(input_dims)
+        self._create_weight_networks(input_dims, r_init)
     
-    def _create_weight_networks(self, input_dims):
+    def _create_weight_networks(self, input_dims, r_init):
         """Create weight networks for each modality."""
         # Modality 1 weights
         self.W_s0 = nn.Sequential(
             nn.Linear(input_dims[0], input_dims[0] * 2, dtype=torch.float32),
             nn.ReLU(),
             nn.Linear(input_dims[0] * 2, self.shared_rank, dtype=torch.float32)
-        ) 
-        self.W_s0.apply(self._init_weights)  
+        )   
         self.W_m0 = nn.Sequential(
             nn.Linear(input_dims[0], input_dims[0] * 2, dtype=torch.float32),
             nn.ReLU(),
             nn.Linear(input_dims[0] * 2, self.specific_rank, dtype=torch.float32)
         )
-        self.W_m0.apply(self._init_weights)
+        
         # Modality 2 weights
         self.W_s1 = nn.Sequential(
             nn.Linear(input_dims[1], input_dims[1] * 2, dtype=torch.float32),
             nn.ReLU(),
             nn.Linear(input_dims[1] * 2, self.shared_rank, dtype=torch.float32)
-        )  
-        self.W_m0.apply(self._init_weights)     
+        )       
         self.W_m1 = nn.Sequential(
             nn.Linear(input_dims[1], input_dims[1] * 2, dtype=torch.float32),
             nn.ReLU(),
             nn.Linear(input_dims[1] * 2, self.specific_rank, dtype=torch.float32)
         )
-        self.W_m0.apply(self._init_weights)
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.kaiming_normal_(module.weight, nonlinearity='relu')
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
+        # custom weight initialization
+        custom_weight_init(self.W_s0, init_option=r_init)
+        custom_weight_init(self.W_m0, init_option=r_init)
+        custom_weight_init(self.W_s1, init_option=r_init)
+        custom_weight_init(self.W_m1, init_option=r_init)
     
-    def _orthogonal_init(self):
-        nn.init.orthogonal_(self.R_s)
-        nn.init.orthogonal_(self.R_m1)
-        nn.init.orthogonal_(self.R_m2)
+    def _orthogonal_init(self, r_init):
+        """Initialize projection matrices with uniform distribution."""
+        custom_weight_init(self.R_s, init_option=r_init)
+        custom_weight_init(self.R_m1, init_option=r_init)
+        custom_weight_init(self.R_m2, init_option=r_init)
     
     def get_trainable_parameters(self):
         """Get parameters to train based on current stage."""
@@ -209,8 +229,8 @@ class MultiLoReFT(nn.Module):
                 zs = F.linear(phi, self.R_s)
                 zm = F.linear(phi, (self.R_m1 if i==0 else self.R_m2))
             else:
-                zs = torch.matmul(z, self.R_s[shared_sv].T)
-                zm = torch.matmul(z, (self.R_m1[m1_sv].T if i==0 else self.R_m2[m2_sv].T))
+                zs = torch.matmul(phi, self.R_s[shared_sv].T)
+                zm = torch.matmul(phi, (self.R_m1[m1_sv].T if i==0 else self.R_m2[m2_sv].T))
             rep_components.append((zm, zs))
         
         return rep_components
@@ -232,7 +252,7 @@ class MultiLoReFT(nn.Module):
         elif self.trainable_stage == "joint":
             return [l_orthogonal, l_shared, l_mi], ["Orthogonal Loss", "Shared Loss", "Mutual Info Loss"], all_losses, all_loss_names
         else:
-            raise ValueError(f"Unknown training stage: {stage}")
+            raise ValueError(f"Unknown training stage: {self.trainable_stage}")
 
     def evaluate_validation_loss(self, val_dataloader):
         """Evaluate model on validation set."""
@@ -241,13 +261,13 @@ class MultiLoReFT(nn.Module):
         with torch.no_grad():
             for val_batch in val_dataloader:
                 if self.encoders is not None:
-                    x1, x2, label = batch
+                    x1, x2, label = val_batch # this was batch, there might have been an issue with multimodal_projector if it used the training batch!
                     label = label.to(self.device)
                     x1 = (x1).to(self.device)
                     x2 = (x2).to(self.device)
                     # This needs to be customized
-                    tokens_en = BertTokenizer.from_pretrained('bert-base-uncased')(x2, return_tensors="pt", padding=True, truncation=True).to(device)
-                    tokens_fr = AutoTokenizer.from_pretrained("sentence-transformers/LaBSE")(x2, padding=True, truncation=True, return_tensors="pt").to(device)
+                    tokens_en = BertTokenizer.from_pretrained('bert-base-uncased')(x2, return_tensors="pt", padding=True, truncation=True).to(self.device)
+                    tokens_fr = AutoTokenizer.from_pretrained("sentence-transformers/LaBSE")(x2, padding=True, truncation=True, return_tensors="pt").to(self.device)
                     with torch.no_grad():
                         model_output = self.encoders[2](**tokens_fr)
                         embeddings_fr = model_output.last_hidden_state[:, 0, :].to(self.device)
@@ -273,21 +293,37 @@ class MultiLoReFT(nn.Module):
                 losses_list, _, _, _ = self.compute_stage_losses(h1, h2, z_components)
                 val_loss = torch.stack(losses_list).mean()
                 val_total_loss += val_loss.item()
-        self.train()
+        self.train() 
         return val_total_loss / len(val_dataloader)
+    
+    def init_lr_scheduler(self, optimizer, hyperparameters, early_stopping_config, epochs):
+        if hyperparameters is None:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
+        if hyperparameters.get('lr_schedule') == 'cosine':
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+        elif hyperparameters.get('lr_schedule') == 'exponential':
+            scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+        elif hyperparameters.get('lr_schedule') == 'linear':
+            scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=early_stopping_config[self.trainable_stage]["max_epochs"])
+        elif hyperparameters.get('lr_schedule') == 'constant':
+            scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=epochs)
+        else:
+            # Default to cosine annealing if no valid schedule is provided
+            print("No valid learning rate schedule provided, using CosineAnnealingLR.")
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
 
-
-    def train_projection(self, dataloader, val_dataloader, early_stopping_config, lr=1e-3, epochs=100, exp_name="projection_module"):#save_path="./ckpts/projection_module.pth"):
+    def train_projection(self, dataloader, val_dataloader, early_stopping_config, hyperparameters=None, lr=1e-3, epochs=100, exp_name="projection_module"):#save_path="./ckpts/projection_module.pth"):
         """Train the projection model with early stopping."""
         save_path='./ckpts/%s.pth'%(exp_name)
-        print(f"Training on device: {self.device}")
-        print(f"Model is on device: {next(self.parameters()).device}")
+        if self.verbose:
+            print(f"Training on device: {self.device}")
+            print(f"Model is on device: {next(self.parameters()).device}")
         # Initialize loss tracking
         loss_balancer = GradientNormalizedLoss(num_losses=3)
         all_epoch_losses = []
         trainable_params = self.get_trainable_parameters()
         optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
+        scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
         
         # Training loop
         for epoch in range(epochs):
@@ -348,8 +384,7 @@ class MultiLoReFT(nn.Module):
                 if self.trainable_stage == "joint" and val_loss <= self.stage_tracking['best_val_loss'] and epoch>40:  # Index 2 is MI loss based on all_loss_names
                     self.prune_singular_values()
                     optimizer = self.update_optimizer(optimizer)
-                    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
-            
+                    scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
             
             if self.staging:
                 stage_config = early_stopping_config[self.trainable_stage]
@@ -384,7 +419,7 @@ class MultiLoReFT(nn.Module):
                     # trainable_params = self.get_trainable_parameters()
                     # optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-4)
                     optimizer = self.update_optimizer(optimizer)
-                    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
+                    scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
                     self.stage_tracking["best_val_loss"] = 5000
                     self.stage_tracking["plateau_counter"] = 0
                     self.stage_tracking["min_epochs_counter"] = 0
@@ -392,23 +427,67 @@ class MultiLoReFT(nn.Module):
                 # # Update optimizer
                 # trainable_params = model.get_trainable_parameters()
                 # optimizer = torch.optim.Adam(trainable_params, lr=1e-4, weight_decay=1e-4)
+            else: # ealy stopping!
+                # Update stage tracking
+                stage_config = early_stopping_config[self.trainable_stage]
+                self.stage_tracking["min_epochs_counter"] += 1
+                # Calculate improvement
+                relative_improvement = (self.stage_tracking["best_val_loss"] - val_loss) / self.stage_tracking["best_val_loss"]
+                if val_loss < self.stage_tracking["best_val_loss"]:
+                    self.stage_tracking["best_val_loss"] = val_loss
+
+                # Update tracking metrics
+                if relative_improvement > stage_config["min_improvement_ratio"]:
+                    self.stage_tracking["plateau_counter"] = 0
+                else:
+                    self.stage_tracking["plateau_counter"] += 1
+                
+                # Check for stage transition
+                should_switch = (
+                    self.stage_tracking["plateau_counter"] >= stage_config["patience"] or
+                    self.stage_tracking["min_epochs_counter"] >= stage_config["max_epochs"]
+                )
+
+                if should_switch:
+                    if self.verbose:
+                        print(f"***** [Epoch {epoch}] → Early stopping after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
+                    break
+
             
-            # Print progress
-            if epoch % 1 == 0:
-                print(f"[Epoch {epoch}] {self.trainable_stage.upper()} stage: "
-                    f"val_loss={val_loss:.4f}, "
-                    f"best_val_loss={self.stage_tracking['best_val_loss']:.4f}, ")
-                loss_report = ", ".join(f"{name}={val:.4f}" for val, name in zip(epoch_losses, all_loss_names))
-                print(f"Loss values: {loss_report}")
-                if self.staging:
-                    print(f"relative_improvement={relative_improvement*100:.2f}%, "
-                    f"plateau={self.stage_tracking['plateau_counter']}/{stage_config['patience']}, "
-                    f"epochs={self.stage_tracking['min_epochs_counter']}/{stage_config['max_epochs']}")
+            if self.wandb_log:
+                val_loss, val_logs, val_log_names = evaluate_validation_loss(self, val_dataloader, self.device)
+                corr_rank_dict = calc_corrs_and_ranks(self)
+                log_dict = {
+                    "epoch": epoch,
+                    "stage": [0 if self.trainable_stage == "shared" else 1 if self.trainable_stage == "private" else 2][0],
+                    "lr": optimizer.param_groups[0]['lr'],
+                    "relative_improvement": (self.stage_tracking["best_val_loss"] - val_loss) / self.stage_tracking["best_val_loss"]
+                }
+                for i, val_log_name in enumerate(val_log_names):
+                    log_dict[val_log_name] = val_logs[i]
+                for key, value in corr_rank_dict.items():
+                    log_dict[key] = value
+                if epoch > 0:
+                    for i, loss_name in enumerate(all_loss_names):
+                        log_dict[loss_name] = all_epoch_losses[-1][i]
+                log_wandb(log_dict)
+            elif self.verbose:
+                # Print progress
+                if epoch % 1 == 0:
+                    print(f"[Epoch {epoch}] {self.trainable_stage.upper()} stage: "
+                        f"val_loss={val_loss:.4f}, "
+                        f"best_val_loss={self.stage_tracking['best_val_loss']:.4f}, ")
+                    loss_report = ", ".join(f"{name}={val:.4f}" for val, name in zip(epoch_losses, all_loss_names))
+                    print(f"Loss values: {loss_report}")
+                    if self.staging:
+                        print(f"relative_improvement={relative_improvement*100:.2f}%, "
+                        f"plateau={self.stage_tracking['plateau_counter']}/{stage_config['patience']}, "
+                        f"epochs={self.stage_tracking['min_epochs_counter']}/{stage_config['max_epochs']}")
             self.save_checkpoint(optimizer, epoch, loss, filepath=save_path)
         
         # Plot final losses
         all_epoch_losses = np.array(all_epoch_losses)
-        plot_losses(all_epoch_losses, loss_names=all_loss_names, save_path="./plots/%s_loss_curves.pdf"%(exp_name), log_path="./logs/%s_loss_curves.csv"%(exp_name))
+        #plot_losses(all_epoch_losses, loss_names=all_loss_names, save_path="./plots/%s_loss_curves.pdf"%(exp_name), log_path="./logs/%s_loss_curves.csv"%(exp_name))
         self.save_checkpoint(optimizer, epoch, loss, filepath=save_path)
 
 
