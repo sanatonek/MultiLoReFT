@@ -34,7 +34,10 @@ def custom_weight_init(m, init_option='kaiming_normal'):
         
         if m.bias is not None:
             init.zeros_(m.bias)
-    else:
+    elif isinstance(m, torch.nn.Sequential):
+        for sub_m in m:
+            custom_weight_init(sub_m, init_option)
+    elif isinstance(m, torch.nn.Parameter):
         if init_option == 'xavier_uniform':
             init.xavier_uniform_(m)
         elif init_option == 'xavier_normal':
