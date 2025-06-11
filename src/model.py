@@ -21,7 +21,7 @@ class MultiLoReFT(nn.Module):
             pruning=True, 
             r_init="uniform",
             device=None, 
-            dataset_type=None,
+            dataset_name="simulated",
             verbose=True,
             wandb_log=False
         ):
@@ -30,7 +30,7 @@ class MultiLoReFT(nn.Module):
         self.specific_rank = specific_rank
         self.pruning_threshold = pruning_threshold
         self.pruned = False
-        self.dataset_type = dataset_type
+        self.dataset_name = dataset_name
         self.encoders = encoders
         if encoders is not None:
             for i in range(len(encoders)):
@@ -41,18 +41,14 @@ class MultiLoReFT(nn.Module):
         self.device = device
         if staging:
             self.trainable_stage = "shared"
-            self.stage_tracking = {
-                    "best_val_loss": 5000,
-                    "plateau_counter": 0,
-                    "min_epochs_counter": 0,
-                }
         else:
             self.trainable_stage = "joint"
-            self.stage_tracking = {
-                    "best_val_loss": 5000,
-                    "plateau_counter": 0,
-                    "min_epochs_counter": 0,
-                }
+        self.stage_tracking = {
+                "best_val_loss": 5000,
+                "best_val_MI_loss": 5000,
+                "plateau_counter": 0,
+                "min_epochs_counter": 0,
+            }
         self.verbose = verbose
         self.wandb_log = wandb_log
         
@@ -97,11 +93,16 @@ class MultiLoReFT(nn.Module):
         custom_weight_init(self.W_s1, init_option=r_init)
         custom_weight_init(self.W_m1, init_option=r_init)
     
-    def _orthogonal_init(self, r_init):
-        """Initialize projection matrices with uniform distribution."""
-        custom_weight_init(self.R_s, init_option=r_init)
-        custom_weight_init(self.R_m1, init_option=r_init)
-        custom_weight_init(self.R_m2, init_option=r_init)
+    #def _orthogonal_init(self, r_init):
+    #    """Initialize projection matrices with uniform distribution."""
+    #    custom_weight_init(self.R_s, init_option=r_init)
+    #    custom_weight_init(self.R_m1, init_option=r_init)
+    #    custom_weight_init(self.R_m2, init_option=r_init)
+    
+    def _orthogonal_init(self):
+        nn.init.orthogonal_(self.R_s, gain=0.1)
+        nn.init.orthogonal_(self.R_m1, gain=0.1)
+        nn.init.orthogonal_(self.R_m2, gain=0.1)
     
     def get_trainable_parameters(self):
         """Get parameters to train based on current stage."""
@@ -257,11 +258,13 @@ class MultiLoReFT(nn.Module):
     def evaluate_validation_loss(self, val_dataloader):
         """Evaluate model on validation set."""
         val_total_loss = 0
+        val_loss_list = [0]*3
+        loss_balancer = GradientNormalizedLoss(num_losses=3)
         self.eval()
         with torch.no_grad():
             for val_batch in val_dataloader:
                 if self.encoders is not None:
-                    x1, x2, label = val_batch # this was batch, there might have been an issue with multimodal_projector if it used the training batch!
+                    x1, x2, label = val_batch
                     label = label.to(self.device)
                     x1 = (x1).to(self.device)
                     x2 = (x2).to(self.device)
@@ -277,7 +280,7 @@ class MultiLoReFT(nn.Module):
                         h2 = torch.where(label.unsqueeze(1).expand(-1, embeddings_en.size(1)) == 0, embeddings_en, embeddings_fr)
                 else:
                     h1, h2, x1, x2, label = val_batch
-                    if self.dataset_type == "flickr":
+                    if self.dataset_name == "flickr":
                         # Generate random binary labels for each item in batch
                         lang_idx = torch.randint(0, 2, (len(h1),), device=self.device)
                         # Use the labels to select language for each item
@@ -290,11 +293,14 @@ class MultiLoReFT(nn.Module):
                 phis = self.forward([h1, h2])
                 
                 z_components = self.decouple(phis, full=True)
-                losses_list, _, _, _ = self.compute_stage_losses(h1, h2, z_components)
+                losses_list, _, all_losses_list, _ = self.compute_stage_losses(h1, h2, z_components)
                 val_loss = torch.stack(losses_list).mean()
                 val_total_loss += val_loss.item()
+                for i, loss in enumerate(all_losses_list):
+                    val_loss_list[i] += loss
         self.train() 
-        return val_total_loss / len(val_dataloader)
+        val_loss_list = [loss / len(val_dataloader) for loss in val_loss_list]
+        return val_total_loss / len(val_dataloader), val_loss_list
     
     def init_lr_scheduler(self, optimizer, hyperparameters, early_stopping_config, epochs):
         if hyperparameters is None:
@@ -322,6 +328,7 @@ class MultiLoReFT(nn.Module):
         # Initialize loss tracking
         loss_balancer = GradientNormalizedLoss(num_losses=3)
         all_epoch_losses = []
+        all_epoch_stages = []
         trainable_params = self.get_trainable_parameters()
         optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-4)
         scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
@@ -330,6 +337,25 @@ class MultiLoReFT(nn.Module):
         for epoch in range(epochs):
             total_loss = 0
             epoch_losses = np.zeros(3)
+
+            if self.wandb_log:
+                val_loss, val_logs, val_log_names = evaluate_validation_loss(self, val_dataloader, self.device)
+                corr_rank_dict = calc_corrs_and_ranks(self)
+                log_dict = {
+                    "epoch": epoch,
+                    "stage": [0 if self.trainable_stage == "shared" else 1 if self.trainable_stage == "private" else 2][0],
+                    "lr": optimizer.param_groups[0]['lr'],
+                    "relative_improvement": (self.stage_tracking["best_val_loss"] - val_loss) / self.stage_tracking["best_val_loss"]
+                }
+                for i, val_log_name in enumerate(val_log_names):
+                    log_dict[val_log_name] = val_logs[i]
+                for key, value in corr_rank_dict.items():
+                    log_dict[key] = value
+                if epoch > 0:
+                    for i, loss_name in enumerate(all_loss_names):
+                        log_dict[loss_name] = all_epoch_losses[-1][i]
+                log_wandb(log_dict)
+            
             # Training step
             for batch in (dataloader):
                 if self.encoders is not None:
@@ -349,7 +375,7 @@ class MultiLoReFT(nn.Module):
                         h2 = torch.where(label.unsqueeze(1).expand(-1, embeddings_en.size(1)) == 0, embeddings_en, embeddings_fr)
                 else:
                     h1, h2, x1, x2, label = batch
-                    if self.dataset_type == "flickr":
+                    if self.dataset_name == "flickr":
                         # Generate random binary labels for each item in batch
                         lang_idx = torch.randint(0, 2, (len(h1),), device=self.device)
                         # Use the labels to select language for each item
@@ -377,12 +403,13 @@ class MultiLoReFT(nn.Module):
             # Update metrics
             epoch_losses = epoch_losses / len(dataloader)
             all_epoch_losses.append(epoch_losses)
+            all_epoch_stages.append(self.trainable_stage)
             scheduler.step()
             
-            val_loss = self.evaluate_validation_loss(val_dataloader)
+            val_loss, val_loss_list = self.evaluate_validation_loss(val_dataloader)
             if self.pruning:
                 # Prune if in joint stage
-                if self.trainable_stage == "joint" and val_loss <= self.stage_tracking['best_val_loss'] and epoch>40:  # Index 2 is MI loss based on all_loss_names
+                if self.trainable_stage == "joint" and val_loss_list[2] <= self.stage_tracking['best_val_MI_loss']*1.05 and epoch>40:
                     self.prune_singular_values()
                     optimizer = self.update_optimizer(optimizer)
                     scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
@@ -396,6 +423,8 @@ class MultiLoReFT(nn.Module):
                 
                 if val_loss<self.stage_tracking["best_val_loss"]:
                     self.stage_tracking["best_val_loss"] = val_loss
+                if val_loss_list[2] < self.stage_tracking["best_val_MI_loss"]:
+                    self.stage_tracking["best_val_MI_loss"] = val_loss_list[2]
                 
                 # Update tracking metrics
                 if relative_improvement > stage_config["min_improvement_ratio"]:
@@ -410,13 +439,16 @@ class MultiLoReFT(nn.Module):
                 )
                 
                 if self.trainable_stage != "joint" and self.staging and should_switch:
+                    print(f"Final {self.trainable_stage} stage loss: {val_loss:.4f}")
                     if self.trainable_stage == "shared":
                         self.trainable_stage = "private"
+                        self.stage_switches = getattr(self, "stage_switches", [])
+                        self.stage_switches.append(('private', epoch))
                         print(f"***** [Epoch {epoch}] → Switched to PRIVATE stage after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
                     elif self.trainable_stage == "private":
                         self.trainable_stage = "joint"
+                        self.stage_switches.append(('joint', epoch))
                         print(f"***** [Epoch {epoch}] → Switched to JOINT stage after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
-                    print(f"Final {self.trainable_stage} stage loss: {val_loss:.4f}")
                     # trainable_params = self.get_trainable_parameters()
                     # optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-4)
                     optimizer = self.update_optimizer(optimizer)
@@ -457,26 +489,8 @@ class MultiLoReFT(nn.Module):
                     if self.verbose:
                         print(f"***** [Epoch {epoch}] → Early stopping after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
                     break
-
             
-            if self.wandb_log:
-                val_loss, val_logs, val_log_names = evaluate_validation_loss(self, val_dataloader, self.device)
-                corr_rank_dict = calc_corrs_and_ranks(self)
-                log_dict = {
-                    "epoch": epoch,
-                    "stage": [0 if self.trainable_stage == "shared" else 1 if self.trainable_stage == "private" else 2][0],
-                    "lr": optimizer.param_groups[0]['lr'],
-                    "relative_improvement": (self.stage_tracking["best_val_loss"] - val_loss) / self.stage_tracking["best_val_loss"]
-                }
-                for i, val_log_name in enumerate(val_log_names):
-                    log_dict[val_log_name] = val_logs[i]
-                for key, value in corr_rank_dict.items():
-                    log_dict[key] = value
-                if epoch > 0:
-                    for i, loss_name in enumerate(all_loss_names):
-                        log_dict[loss_name] = all_epoch_losses[-1][i]
-                log_wandb(log_dict)
-            elif self.verbose:
+            if self.verbose:
                 # Print progress
                 if epoch % 1 == 0:
                     print(f"[Epoch {epoch}] {self.trainable_stage.upper()} stage: "
@@ -492,8 +506,12 @@ class MultiLoReFT(nn.Module):
         
         # Plot final losses
         all_epoch_losses = np.array(all_epoch_losses)
-        #plot_losses(all_epoch_losses, loss_names=all_loss_names, save_path="./plots/%s_loss_curves.pdf"%(exp_name), log_path="./logs/%s_loss_curves.csv"%(exp_name))
+        if self.verbose:
+            plot_losses(all_epoch_losses, loss_names=all_loss_names, save_path="./plots/%s_loss_curves.pdf"%(exp_name), log_path="./logs/%s_loss_curves.csv"%(exp_name))
         self.save_checkpoint(optimizer, epoch, loss, filepath=save_path)
+
+        if self.wandb_log:
+            return all_epoch_losses, all_loss_names, all_epoch_stages
 
 
     def save_checkpoint(self, optimizer, epoch, loss, filepath):
