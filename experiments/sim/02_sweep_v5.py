@@ -127,8 +127,8 @@ def main(dev_id=1, seed=0, out_dir="./results/", file_name="sweep_v2"):
                                 # Initialize model
                                 projection_model = MultiLoReFT(
                                     input_dims=[5,5], 
-                                    shared_rank=4,
-                                    specific_rank=4, 
+                                    shared_rank=hyperparameters["n_shared_rank"][0],
+                                    specific_rank=hyperparameters["n_specific_rank"][0],
                                     staging=staging,
                                     pruning=pruning,
                                     r_init=weight_init,
@@ -137,18 +137,32 @@ def main(dev_id=1, seed=0, out_dir="./results/", file_name="sweep_v2"):
                                     device=device).to(device)
                                 
                                 # Train model
-                                train_df = projection_model.train_projection(dataloader, val_dataloader, early_stopping_config, epochs=epochs,hyperparameters=model_hyperparameters)
+                                all_epoch_losses, all_loss_names, all_epoch_stages = projection_model.train_projection(dataloader, val_dataloader, early_stopping_config, epochs=epochs,hyperparameters=model_hyperparameters)
+                                
+                                # get eval metrics and plot
+                                h1 = F.normalize(torch.Tensor(val_dataloader.dataset.h1).float(), dim=1).to(device)
+                                h2 = F.normalize(torch.Tensor(val_dataloader.dataset.h2).float(), dim=1).to(device)
+                                labels = val_dataloader.dataset.labels
+                                phis = projection_model.forward([h1,h2])
+                                z_n = projection_model.decouple(phis, full=True, th=projection_model.pruning_threshold)
+                                plot_representations_wandb(z_n, labels)
+                                plot_projection_matrices_wandb(projection_model)
+                                # return all training losses
+                                all_epoch_losses = np.array(all_epoch_losses)
+                                train_df = pd.DataFrame(all_epoch_losses, columns=all_loss_names)
+                                train_df['stage'] = all_epoch_stages
+                                train_df['epoch'] = np.arange(len(train_df))
                                 train_df['run_iter'] = run_iter
                                 train_df['seed'] = seed
 
                                 n_train = 4000
                                 n_val = 1000
-                                regression_df, classification_df = eval_model(projection_model, h1[n_train:n_train+n_val], h2[n_train:n_train+n_val], labels[n_train:n_train+n_val], device)
+                                regression_df, classification_df = eval_model(projection_model, h1, h2, labels, device)
                                 regression_df['run_iter'] = run_iter
                                 regression_df['seed'] = seed
                                 classification_df['run_iter'] = run_iter
                                 classification_df['seed'] = seed
-                                eval_df = reeval_model(projection_model, h1[n_train:n_train+n_val], h2[n_train:n_train+n_val], labels[n_train:n_train+n_val], device)
+                                eval_df = reeval_model(projection_model, h1, h2, labels, device)
                                 eval_df['run_iter'] = run_iter
                                 eval_df['seed'] = seed
 
