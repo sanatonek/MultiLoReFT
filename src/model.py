@@ -57,7 +57,7 @@ class MultiLoReFT(nn.Module):
         self.R_m1 = nn.Parameter(torch.empty(specific_rank, input_dims[0], dtype=torch.float32))
         self.R_m2 = nn.Parameter(torch.empty(specific_rank, input_dims[1], dtype=torch.float32))
         # Initialize weights
-        self._orthogonal_init(r_init)
+        self._orthogonal_init()
         # Create weight networks for each modality
         self._create_weight_networks(input_dims, r_init)
     
