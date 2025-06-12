@@ -8,7 +8,7 @@ from sklearn.metrics import mean_squared_error, accuracy_score
 
 def setup_wandb(run_name, hyperparams, project_name, entity):
     try:
-        wandb.init(project=project_name, entity=entity, config=hyperparams)
+        wandb.init(project=project_name, entity=entity, config=hyperparams, settings=wandb.Settings(init_timeout=180))
         wandb.run.name = run_name
     except:
         raise ValueError("Could not initialize wandb. Please check your settings.")

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import gc
 from transformers import BertTokenizer, AutoTokenizer
 from src.losses import loss_shared_consistency, loss_orthogonality, loss_mutual_info, GradientNormalizedLoss
 from src.visualization import plot_losses
@@ -288,8 +289,10 @@ class MultiLoReFT(nn.Module):
                         x2 = [x2[0][i] if idx == 0 else x2[1][i] for i, idx in enumerate(lang_idx)]
                         label = lang_idx
                 
-                h1 = F.normalize(h1.float(), dim=1).to(self.device)
-                h2 = F.normalize(h2.float(), dim=1).to(self.device)
+                #h1 = F.normalize(h1.float(), dim=1).to(self.device) # already in forward pass
+                #h2 = F.normalize(h2.float(), dim=1).to(self.device)
+                h1 = h1.to(self.device)
+                h2 = h2.to(self.device)
                 phis = self.forward([h1, h2])
                 
                 z_components = self.decouple(phis, full=True)
@@ -383,8 +386,10 @@ class MultiLoReFT(nn.Module):
                         x2 = [x2[0][i] if idx == 0 else x2[1][i] for i, idx in enumerate(lang_idx)]
                         label = lang_idx
                 
-                h1 = F.normalize(h1.float(), dim=1).to(self.device)
-                h2 = F.normalize(h2.float(), dim=1).to(self.device)
+                #h1 = F.normalize(h1.float(), dim=1).to(self.device)
+                #h2 = F.normalize(h2.float(), dim=1).to(self.device)
+                h1 = h1.to(self.device)
+                h2 = h2.to(self.device)
                 phis = self.forward([h1, h2])
                 
                 z_components = self.decouple(phis, full=True)
@@ -521,3 +526,124 @@ class MultiLoReFT(nn.Module):
             'model_state_dict': self.state_dict(),
             # 'optimizer_state_dict': optimizer.state_dict()
         }, filepath)
+
+# create a class based on MultiLoReFT with changes to architecture and forward method
+# init the multiloref class
+
+class MM_Adapter(MultiLoReFT):
+    def __init__(
+            self,
+            input_dims,
+            shared_rank,
+            specific_rank,
+            staging=True,
+            encoders=None,
+            pruning_threshold=0.05,
+            pruning=True,
+            r_init="uniform",
+            device=None,
+            dataset_name="simulated",
+            verbose=True,
+            wandb_log=False,
+            scaling_factor=1
+    ):
+        super().__init__(input_dims, shared_rank, specific_rank, staging, encoders, pruning_threshold, pruning, r_init, device, dataset_name, verbose, wandb_log)
+
+        # remove all previously initialized parameters
+        self._parameters = {}
+        # emtpty memory
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        self.scaling_factor = scaling_factor
+
+        self.encoder1 = nn.Sequential(
+            nn.Linear(input_dims[0], input_dims[0] * 2, dtype=torch.float32),
+            nn.ReLU(),
+            nn.Linear(input_dims[0] * 2, input_dims[0], dtype=torch.float32) # just a nonlinear transformation should be fine
+        )
+        self.encoder2 = nn.Sequential(
+            nn.Linear(input_dims[1], input_dims[1] * 2, dtype=torch.float32),
+            nn.ReLU(),
+            nn.Linear(input_dims[1] * 2, input_dims[1], dtype=torch.float32)
+        )
+        self.sparse = nn.Sequential(
+            nn.Linear(input_dims[0] + input_dims[1], (input_dims[0] + input_dims[1]) * self.scaling_factor, dtype=torch.float32), # actually dont need it sparse so smaller should be fine to be able to prune
+            nn.Softplus()
+        )
+
+        # Initialize projection matrices
+        self.R_s = nn.Parameter(torch.empty(self.shared_rank, (input_dims[0] + input_dims[1]) * self.scaling_factor, dtype=torch.float32))
+        self.R_m1 = nn.Parameter(torch.empty(self.specific_rank, (input_dims[0] + input_dims[1]) * self.scaling_factor, dtype=torch.float32))
+        self.R_m2 = nn.Parameter(torch.empty(self.specific_rank, (input_dims[0] + input_dims[1]) * self.scaling_factor, dtype=torch.float32))
+        self._orthogonal_init()
+
+        self.decoder1 = nn.Sequential(
+            nn.Linear(self.shared_rank + self.specific_rank, input_dims[0] * 2, dtype=torch.float32),
+            nn.ReLU(),
+            nn.Linear(input_dims[0] * 2, input_dims[0], dtype=torch.float32)
+        )
+        self.decoder2 = nn.Sequential(
+            nn.Linear(self.shared_rank + self.specific_rank, input_dims[1] * 2, dtype=torch.float32),
+            nn.ReLU(),
+            nn.Linear(input_dims[1] * 2, input_dims[1], dtype=torch.float32)
+        )
+
+        self._weight_init(r_init)
+    
+    def _weight_init(self, r_init):
+        custom_weight_init(self.encoder1, init_option=r_init)
+        custom_weight_init(self.encoder2, init_option=r_init)
+        custom_weight_init(self.sparse, init_option=r_init)
+        custom_weight_init(self.decoder1, init_option=r_init)
+        custom_weight_init(self.decoder2, init_option=r_init)
+
+    def forward(self, embeddings):
+        """Forward pass through the network."""
+        h1, h2 = embeddings[0], embeddings[1]
+
+        h1_h = self.encoder1(h1)
+        h2_h = self.encoder2(h2)
+        h_h = torch.cat((h1_h, h2_h), dim=1)
+        h_sparse = self.sparse(h_h)
+
+        z_m1 = torch.matmul(h_sparse, self.R_m1.T)
+        z_m2 = torch.matmul(h_sparse, self.R_m2.T)
+        z_s = torch.matmul(h_sparse, self.R_s.T)
+
+        h1_out = self.decoder1(torch.cat((z_m1, z_s), dim=1))
+        h2_out = self.decoder2(torch.cat((z_m2, z_s), dim=1))
+        return h1_out, h2_out
+    
+    def decouple(self, h, full=True, th=0.1):
+        h1, h2 = h[0], h[1]
+
+        h1_h = self.encoder1(h1)
+        h2_h = self.encoder2(h2)
+        h_h = torch.cat((h1_h, h2_h), dim=1)
+        h_sparse = self.sparse(h_h)
+
+        z_m1 = torch.matmul(h_sparse, self.R_m1.T)
+        z_m2 = torch.matmul(h_sparse, self.R_m2.T)
+        z_s = torch.matmul(h_sparse, self.R_s.T)
+
+        rep_components = [
+            [z_m1, z_s],  # Modality-specific and shared representations for modality 1
+            [z_m2, z_s]   # Modality-specific and shared representations for modality 2
+        ]
+        
+        return rep_components
+    
+    def get_trainable_parameters(self):
+        """Get parameters to train based on current stage."""
+        if self.trainable_stage == "shared":
+            return [self.R_s] + list(self.encoder1.parameters()) + list(self.encoder2.parameters()) + list(self.sparse.parameters()) + list(self.decoder1.parameters()) + list(self.decoder2.parameters())
+        elif self.trainable_stage == "private":
+            return [self.R_m1, self.R_m2] + list(self.encoder1.parameters()) + list(self.encoder2.parameters()) + list(self.sparse.parameters()) + list(self.decoder1.parameters()) + list(self.decoder2.parameters())
+        else:  # joint
+            return list(self.parameters())
+    
+    def prune_singular_values(self):
+        # not implemented because this would mean a lot of deletion and redoing of the weights
+        # we can just observe the effective ranks because stuff that goes to zero will unlikely go back up
+        pass

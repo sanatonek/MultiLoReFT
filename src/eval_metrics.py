@@ -146,7 +146,7 @@ def evaluate_regression(z_n, h1, h2):
                 z = torch.cat((z_n[i][0], z_n[i][1]), dim=1)
             else:
                 z = z_n[i][j]
-
+            
             # perform "parallel" regression with linear NN
             train_loader = DataLoader(torch.cat((h[:train_size], z[:train_size]), dim=1), batch_size=64, shuffle=True)
             val_loader = DataLoader(torch.cat((h[train_size:], z[train_size:]), dim=1), batch_size=64, shuffle=False)
@@ -221,58 +221,58 @@ def evaluate_classification(z_n, labels):
     # train a classifier on the shared and modality-specific representations
     #print('Task: Binary classification')
     for name, z in components:
-        try:
-            # Prepare data
-            z_np = z.detach().cpu().numpy()
-            y_np = labels.astype(int)
-            
-            # Check if binary classification
-            unique_classes = np.unique(y_np)
-            if len(unique_classes) != 2:
-                print(f"Warning: Expected binary classification but found {len(unique_classes)} classes. Skipping {name}.")
-                continue
-                
-            # Initialize classifier with balanced class weights for robustness
-            model = LogisticRegression(
-                max_iter=1000, 
-                class_weight='balanced',
-                solver='liblinear',  # Works well for small datasets
-                random_state=0
-            )
-            
-            scoring = {
-                'accuracy': make_scorer(accuracy_score),
-                'precision': make_scorer(precision_score),
-                'recall': make_scorer(recall_score),
-                'f1': make_scorer(f1_score),
-                'roc_auc': make_scorer(roc_auc_score)
-            }
-            
-            cv_results = cross_validate(
-                model, z_np, y_np, 
-                cv=5, 
-                scoring=scoring,
-                return_train_score=False
-            )
-            
-            # Print results
-            #print(f"{name} -----Accuracy:  {cv_results['test_accuracy'].mean():.3f} ± {cv_results['test_accuracy'].std():.3f}",
-            #      f"  Precision: {cv_results['test_precision'].mean():.3f} ± {cv_results['test_precision'].std():.3f}",
-            #      f"  Recall:    {cv_results['test_recall'].mean():.3f} ± {cv_results['test_recall'].std():.3f}",
-            #      f"  F1 Score:  {cv_results['test_f1'].mean():.3f} ± {cv_results['test_f1'].std():.3f}",
-            #      f"  ROC AUC:   {cv_results['test_roc_auc'].mean():.3f} ± {cv_results['test_roc_auc'].std():.3f}")
-            class_df = pd.concat([class_df, pd.DataFrame({
-                "name": [name],
-                "accuracy": [cv_results['test_accuracy'].mean()],
-                "precision": [cv_results['test_precision'].mean()],
-                "recall": [cv_results['test_recall'].mean()],
-                "f1": [cv_results['test_f1'].mean()],
-                "roc_auc": [cv_results['test_roc_auc'].mean()]
-            })], ignore_index=True)
-            
-        except Exception as e:
-            print(f"Error evaluating {name}: {str(e)}")
+        #try:
+        # Prepare data
+        z_np = z.detach().cpu().numpy()
+        y_np = labels.astype(int)
+        
+        # Check if binary classification
+        unique_classes = np.unique(y_np)
+        if len(unique_classes) != 2:
+            print(f"Warning: Expected binary classification but found {len(unique_classes)} classes. Skipping {name}.")
             continue
+            
+        # Initialize classifier with balanced class weights for robustness
+        model = LogisticRegression(
+            max_iter=1000, 
+            class_weight='balanced',
+            solver='liblinear',  # Works well for small datasets
+            random_state=0
+        )
+        
+        scoring = {
+            'accuracy': make_scorer(accuracy_score),
+            'precision': make_scorer(precision_score),
+            'recall': make_scorer(recall_score),
+            'f1': make_scorer(f1_score),
+            'roc_auc': make_scorer(roc_auc_score)
+        }
+        
+        cv_results = cross_validate(
+            model, z_np, y_np, 
+            cv=5, 
+            scoring=scoring,
+            return_train_score=False
+        )
+        
+        # Print results
+        #print(f"{name} -----Accuracy:  {cv_results['test_accuracy'].mean():.3f} ± {cv_results['test_accuracy'].std():.3f}",
+        #      f"  Precision: {cv_results['test_precision'].mean():.3f} ± {cv_results['test_precision'].std():.3f}",
+        #      f"  Recall:    {cv_results['test_recall'].mean():.3f} ± {cv_results['test_recall'].std():.3f}",
+        #      f"  F1 Score:  {cv_results['test_f1'].mean():.3f} ± {cv_results['test_f1'].std():.3f}",
+        #      f"  ROC AUC:   {cv_results['test_roc_auc'].mean():.3f} ± {cv_results['test_roc_auc'].std():.3f}")
+        class_df = pd.concat([class_df, pd.DataFrame({
+            "name": [name],
+            "accuracy": [cv_results['test_accuracy'].mean()],
+            "precision": [cv_results['test_precision'].mean()],
+            "recall": [cv_results['test_recall'].mean()],
+            "f1": [cv_results['test_f1'].mean()],
+            "roc_auc": [cv_results['test_roc_auc'].mean()]
+        })], ignore_index=True)
+        
+        #except Exception as e:
+        #print(f"Error evaluating {name}: {str(e)}")
+        #continue
     
     return class_df
 
