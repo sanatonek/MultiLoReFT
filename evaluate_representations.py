@@ -1,21 +1,27 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 import torch
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt 
 import seaborn as sns
 from sklearn.decomposition import PCA
 from sim_data import generate_multimodal_data
 from torch.utils.data import Dataset, DataLoader
 from utils import *
 import numpy as np
-from multimodal_projector import *
+from multimodal_projector import MultimodalDataset, MultiLoReFT
 from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge, Lasso
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from flickr import Multi30KMixedLangDataset
 from sklearn.metrics import r2_score, accuracy_score
+from sklearn.multiclass import OneVsRestClassifier
 import clip
 import timm
 from torchvision import transforms
 from transformers import BertTokenizer, BertModel
 from transformers import AutoTokenizer, AutoModel
+import argparse
+import random
 
 
 def evaluate_cross_modal_retrieval(phis0, phis1, projector, device):
@@ -89,18 +95,25 @@ def evaluate_predictability(z_n, labels, label_idx):
                         np.all(np.mod(y, 1) == 0))  # Check if all values are integers
     
     if is_classification:
-        print(f"Task type: Classification ({n_unique} classes)")
-        # model = LogisticRegression(max_iter=100)
-        # model = Ridge(alpha=1.0)
-        model = Lasso(alpha=0.1)
-        task_type = "classification"
-        metric_name = "accuracy"
+        n_classes = len(np.unique(y))
+        print(f"Task type: Classification ({n_classes} classes)")
+        # task_type = "classification"
+
+        if n_classes == 2:
+            # model = LogisticRegression(solver='liblinear')  # Binary classification
+            model = Lasso(alpha=0.1)
+            metric_name = "roc_auc"
+            task_type = "binary"
+        else:
+            model = OneVsRestClassifier(LogisticRegression(solver='liblinear'))  # Multi-class
+            metric_name = "roc_auc_ovr"  # Or use "accuracy", "f1_macro", etc., depending on your use case
+            task_type = "multiclass"
     else:
         print(f"Task type: Regression ({n_unique} unique values)")
-        # model = LinearRegression()
-        model = Lasso(alpha=0.1)
+        model = LinearRegression()
+        # model = Lasso(alpha=0.1)
         task_type = "regression"
-        metric_name = "R2 score"
+        metric_name = "MSE"
     
     for name, z in components:
         try:
@@ -139,11 +152,11 @@ def plot_representations(z_n, labels, save_dir="./plots"):
                 # Normal PCA case (2+ dimensions)
                 pca = PCA(n_components=2)
                 x = pca.fit_transform(data)
-                ax.scatter(x[:, 0], x[:, 1], c=labels[:, l_ind])#.cpu().numpy())
+                ax.scatter(x[:, 0], x[:, 1], c=labels[:, l_ind].cpu().numpy() if torch.is_tensor(labels) else labels[:, l_ind])
             elif data.shape[1] == 1:
                 # Handle 1D case by adding a zero column for visualization
                 x = np.hstack([data, np.zeros_like(data)])
-                ax.scatter(x[:, 0], x[:, 1], c=labels[:, l_ind])#.cpu().numpy())
+                ax.scatter(x[:, 0], x[:, 1], c=labels[:, l_ind].cpu().numpy() if torch.is_tensor(labels) else labels[:, l_ind])
             else:
                 # If no valid features, just write "No Data"
                 ax.text(0.5, 0.5, "No Data", horizontalalignment='center', verticalalignment='center')
@@ -192,7 +205,7 @@ def plot_projection_matrices(model, threshold=0.00, save_dir="./plots"):
             sv = torch.linalg.svdvals(model.R_m1).detach().cpu().numpy()
         else:
             sv = torch.linalg.svdvals(model.R_m2).detach().cpu().numpy()
-        ax.set_title(f"{title}\nSVs: {sv}")
+        ax.set_title(f"{title}\nSVs: {sv[min(len(sv)-1, 10)]}")
     
     plt.tight_layout()
     plt.savefig(f"{save_dir}/learned_matrices.pdf")
@@ -223,30 +236,35 @@ def plot_projection_matrices(model, threshold=0.00, save_dir="./plots"):
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset_name = "simulated"
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', type=str, default='simulated', help='Dataset name (simulated or flickr)')
+    args = parser.parse_args()
+    dataset_name = args.dataset
     
     if dataset_name=="simulated":
         # Load and prepare data
-        loaded_data = np.load("./data/simulated_data.npz")
+        loaded_data = np.load("./data/simplest_sim_nongaussian.npz")
         h1 = loaded_data["h1"]
         h2 = loaded_data["h2"]
         x1 = loaded_data["x1"]
         x2 = loaded_data["x2"]
-        labels = loaded_data["labels"][3000:]
+        labels = loaded_data["labels"][5000:6000]
         # Create dataset
-        dataset = MultimodalDataset(h1[3000:], h2[3000:], x1[3000:], x2[3000:], labels)  
+        dataset = MultimodalDataset(h1[5000:6000], h2[5000:6000], x1[5000:6000], x2[5000:6000], labels)  
         # Load model
         # Initialize model
         projection_model = MultiLoReFT(
-            input_dims=[5,5], 
-            shared_rank=4, 
-            specific_rank=4, 
+            input_dims=[10,10], 
+            shared_rank=20, 
+            specific_rank=10, 
+            pruning_threshold=0.2,
             staging=True,
             pruning=True,
             device=device
-        ).to(device)
+        )
+        # projection_model.load_state_dict(torch.load("./ckpts/projection_module.pth", map_location="cpu")["model_state_dict"])
         # projection_model = ProjectionModule(input_dims=[5,5], shared_rank=4, specific_rank=4, data_dim={'A':5, 'B':6}).to(device)
-        checkpoint = load_checkpoint(filepath="./ckpts/projection_module.pth", model=projection_model)
+        projection_model = load_checkpoint(filepath="./ckpts/projection_module.pth", model=projection_model)
         projection_model.eval()
         projection_model = projection_model.to(device)
         # Get representations
@@ -255,7 +273,6 @@ def main():
         phis = projection_model([h1,h2])
         z_n = projection_model.decouple(phis, full=True, th=0.05)
         (z1m, z1s, z2m, z2s) = z_n[0][0], z_n[0][1], z_n[1][0], z_n[1][1]
-        phi_1, phi_2 = phis[0], phis[1]
     
     if dataset_name=="flickr":
         # Load CLIP (English only)
@@ -271,10 +288,10 @@ def main():
                                     shared_rank=128, 
                                     specific_rank=128, 
                                     device=device
-                                ).to(device)
+                                )
                                 
         # checkpoint = load_checkpoint(filepath="./ckpts/flickr_model_no_stage_no_prune.pth", model=projection_model)
-        checkpoint = load_checkpoint(filepath="./ckpts/flickr_model_staging.pth", model=projection_model)
+        projection_model = load_checkpoint(filepath="./ckpts/flickr_model_all.pth", model=projection_model)
         projection_model.eval()
         projection_model = projection_model.to(device)
         labels = []
@@ -301,40 +318,6 @@ def main():
                     random_caption = captions[random_sample-count]
                 else:
                     count += len(batch[0])
-
-                # Randomly choose language (0=English, 1=French)
-                # lang_idx = random.randint(0, 1)
-                # text_feats = text_feats[lang_idx]
-                # captions = captions[lang_idx]
-                # projection_model.encoders[0] = projection_model.encoders[0].to(device)
-                # projection_model.encoders[1] = projection_model.encoders[1].to(device)
-                # projection_model.encoders[2] = projection_model.encoders[2].to(device)
-                # projection_model.encoders[0].eval()
-                # projection_model.encoders[1].eval()
-                # projection_model.encoders[2].eval()
-
-                # preprocess = get_dino_preprocess()
-                # image = (x1).to(device)
-                # tokens_en = BertTokenizer.from_pretrained('bert-base-uncased')(x2, return_tensors="pt", padding=True, truncation=True).to(device)
-                # tokens_fr = AutoTokenizer.from_pretrained("sentence-transformers/LaBSE")(x2, padding=True, truncation=True, return_tensors="pt").to(device)
-                # with torch.no_grad():
-                    # model_output = projection_model.encoders[2](**tokens_fr)
-                    # embeddings_fr = model_output.last_hidden_state[:, 0, :].to(device)
-                
-                    # model_output = projection_model.encoders[1](**tokens_en)
-                    # embeddings_en = model_output.last_hidden_state[:, 0, :].to(device)
-                    
-                    # image_feats = projection_model.encoders[0].forward_features(image)[:, 0, :].to(device)
-                    # text_feats = torch.where(label.unsqueeze(1).expand(-1, embeddings_en.size(1)) == 0, embeddings_en, embeddings_fr)
-                    # captions = x2
-                # image_feats, text_feats, images, captions, label = batch
-                # image_feats = image_feats.to(device)
-                # text_feats = text_feats.to(device)
-                
-                # image_transformed = clip_preprocess(image).to(device)  # (3, H, W)
-                # image_feat_clip = clip_model.encode_image(image_transformed.unsqueeze(0)).squeeze(0).to(torch.float32)
-                # tokens = clip.tokenize([caption_en]).to(device)
-                # text_feat_clip = clip_model.encode_text(tokens).squeeze(0).to(torch.float32)
                 
                 phis = projection_model([image_feats, text_feats])
                 z_n = projection_model.decouple(phis, full=True)
@@ -423,7 +406,7 @@ def main():
     plot_representations((z1m, z1s, z2m, z2s), labels)
     for label_idx in range(labels.shape[1]):
         evaluate_predictability((z1m, z1s, z2m, z2s), labels, label_idx)
-    evaluate_cross_modal_retrieval(phi_1, phi_2, projector=projection_model, device=device, labels=labels)
+    # evaluate_cross_modal_retrieval(phi_1, phi_2, projector=projection_model, device=device, labels=labels)
     
     # Evaluate predictability for each label
 

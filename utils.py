@@ -5,7 +5,7 @@ import torch.optim as optim
 import numpy as np
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, accuracy_score
+from sklearn.metrics import mean_squared_error, accuracy_score, roc_auc_score
 
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -17,7 +17,7 @@ def _patch_linear_layer(layer, new_out_features):
     return new_layer
 
 def load_checkpoint(filepath, model, optimizer=None):
-    checkpoint = torch.load(filepath)
+    checkpoint = torch.load(filepath, map_location="cpu")
     state_dict = checkpoint["model_state_dict"]
 
     # Patch R_s and matching W_s0, W_s1
@@ -55,7 +55,7 @@ def load_checkpoint(filepath, model, optimizer=None):
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
     print(f"Checkpoint loaded from {filepath} (Epoch {checkpoint['epoch']})")
-    return checkpoint
+    return model
 
 
 class SklearnTrainer:
@@ -64,8 +64,8 @@ class SklearnTrainer:
         Wrapper for training a Scikit-Learn model with k-fold cross-validation.
 
         Args:
-            model: A Scikit-Learn model instance (e.g., LinearRegression, RandomForestClassifier).
-            task_type (str): "regression" or "classification".
+            model: A Scikit-Learn model instance.
+            task_type (str): "regression", "binary", or "multiclass".
         """
         self.model = model
         self.task_type = task_type
@@ -80,32 +80,47 @@ class SklearnTrainer:
             k (int): Number of folds for cross-validation.
 
         Returns:
-            float: Mean validation score (MSE for regression, accuracy for classification).
+            tuple: Mean and variance of validation scores.
         """
         kf = KFold(n_splits=k, shuffle=True, random_state=42)
         all_scores = []
 
         for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
-            # Split data
             X_train, X_val = X[train_idx], X[val_idx]
             y_train, y_val = y[train_idx], y[val_idx]
-            # Standardize features
+
             scaler = StandardScaler().fit(X_train)
-            X_train, X_val = scaler.transform(X_train), scaler.transform(X_val)
-            # Train model
+            X_train = scaler.transform(X_train)
+            X_val = scaler.transform(X_val)
+
             self.model.fit(X_train, y_train)
-            # Predict on validation set
-            y_pred = self.model.predict(X_val)
-            # Compute validation score
+
             if self.task_type == "regression":
-                score = mean_squared_error(y_val, y_pred)  # MSE for regression
+                y_pred = self.model.predict(X_val)
+                score = mean_squared_error(y_val, y_pred)
+
+            elif self.task_type == "binary":
+                # Binary classification: use probabilities if available
+                if hasattr(self.model, "predict_proba"):
+                    y_pred = self.model.predict_proba(X_val)[:, 1]
+                else:
+                    y_pred = self.model.predict(X_val)
+                score = roc_auc_score(y_val, y_pred)
+
+            elif self.task_type == "multiclass":
+                if hasattr(self.model, "predict_proba"):
+                    y_pred = self.model.predict_proba(X_val)
+                    score = roc_auc_score(y_val, y_pred, multi_class='ovr', average='macro')
+                else:
+                    y_pred = self.model.predict(X_val)
+                    score = accuracy_score(y_val, y_pred)
+
             else:
-                y_pred = (y_pred > 0.5).astype(int)  # Convert to binary for classification
-                score = accuracy_score(y_val, y_pred)  # Accuracy for classification
+                raise ValueError(f"Unsupported task type: {self.task_type}")
+
             all_scores.append(score)
 
-        mean_score = np.mean(all_scores)
-        return mean_score, np.var(all_scores)
+        return np.mean(all_scores), np.var(all_scores)
     
 def plot_losses(losses, loss_names, save_path=None, log_path=None, stage_switches=None):
     """Plot loss curves in separate horizontal subplots and save loss values."""
@@ -114,7 +129,9 @@ def plot_losses(losses, loss_names, save_path=None, log_path=None, stage_switche
     
     # Calculate total loss
     total_loss = np.sum(losses, axis=1)
+    # all_losses = np.column_stack(losses)
     all_losses = np.column_stack([losses, total_loss])
+    # all_names = loss_names #+ 
     all_names = loss_names + ['Total Loss']
     
     # Create figure with subplots
