@@ -10,6 +10,7 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from multimodal_projector import MultiLoReFT
+from transformers import BertTokenizer, AutoTokenizer
 import torch.nn.functional as F
 import timm
 import sys
@@ -57,9 +58,9 @@ class Multi30KMixedLangDataset(Dataset):
         # Randomly choose language
         lang_idx = random.choice([0, 1])  # 0 = English, 1 = French
         caption = caption_en if lang_idx == 0 else caption_fr
-        text_feat = cached["text_feat_en"] if lang_idx == 0 else cached["text_feat_fr"]
+        text_feat = F.normalize(cached["text_feat_en"] if lang_idx == 0 else cached["text_feat_fr"], dim=0)
 
-        image_feat = cached["image_feat"]
+        image_feat = F.normalize(cached["image_feat"], dim=0)
 
         # Return: h1 (image emb), h2 (text emb), x1 (raw image), x2 (caption str), label (0 or 1)
         return image_feat.to(self.device), [cached["text_feat_en"].to(self.device), cached["text_feat_fr"].to(self.device)], image.to(self.device), [caption_en, caption_fr], lang_idx
@@ -80,13 +81,17 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # Create train/val/test splits
     train_dataset = Multi30KMixedLangDataset(split="train", device=device)
-    train_dataset = torch.utils.data.Subset(train_dataset, range(4000))
+    train_dataset = torch.utils.data.Subset(train_dataset, range(5000))
     val_dataset = Multi30KMixedLangDataset(split="validation", device=device)
     # test_dataset = Multi30KMixedLangDataset(split="test", device=device)
 
     print(f"Train size: {len(train_dataset)}")
     print(f"Val size: {len(val_dataset)}")
     # print(f"Test size: {len(test_dataset)}")
+
+
+    en_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    fr_tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/LaBSE")
 
     train_dataloader = DataLoader(train_dataset, batch_size=64, shuffle=True)
     val_dataloader = DataLoader(val_dataset, batch_size=64, shuffle=False)
@@ -98,9 +103,9 @@ if __name__ == "__main__":
 
     projection_model = MultiLoReFT(
         input_dims=[768,768], 
-        shared_rank=128, 
-        specific_rank=128, 
-        pruning_threshold=1.,
+        shared_rank=1000, 
+        specific_rank=768, 
+        pruning_threshold=0.2,
         device=device,
         staging=True,
         pruning=True,
@@ -127,20 +132,20 @@ if __name__ == "__main__":
         # Early stopping configuration
     early_stopping_config = {
         "shared": {
-            "patience": 5,
+            "patience": 50,
             "min_improvement_ratio": 0.001,
-            "max_epochs": 40
+            "max_epochs": 60
         },
         "private": {
-            "patience": 5,
+            "patience": 50,
             "min_improvement_ratio": 0.001,
-            "max_epochs": 40
+            "max_epochs": 60
         },
         "joint": {
-            "patience": 5,
+            "patience": 50,
             "min_improvement_ratio": 0.001,
             "max_epochs": 2000
         }
     }
 
-    projection_model.train_projection(train_dataloader, val_dataloader, early_stopping_config, lr=1e-3, epochs=60, exp_name='flickr_model_all')#, save_path='./ckpts/flickr_model_staging.pth')
+    projection_model.train_projection(train_dataloader, val_dataloader, early_stopping_config, lr=1e-3, epochs=250, exp_name='flickr_model_all', en_tokenizer=en_tokenizer, fr_tokenizer=fr_tokenizer)#, save_path='./ckpts/flickr_model_staging.pth')
