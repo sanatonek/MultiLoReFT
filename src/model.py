@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import gc
 from transformers import BertTokenizer, AutoTokenizer
-from src.losses import loss_shared_consistency, loss_orthogonality, loss_mutual_info, GradientNormalizedLoss
+from src.losses import loss_shared_consistency, loss_orthogonality, loss_mutual_info, GradientNormalizedLoss, loss_independence
 from src.visualization import plot_losses
 from src.utils import custom_weight_init, log_wandb
 from src.eval_metrics import calc_corrs_and_ranks, evaluate_validation_loss, eval_model, reeval_model
@@ -24,7 +24,8 @@ class MultiLoReFT(nn.Module):
             device=None, 
             dataset_name="simulated",
             verbose=True,
-            wandb_log=False
+            wandb_log=False,
+            intervene_layer=-1,
         ):
         super(MultiLoReFT, self).__init__()
         self.shared_rank = shared_rank
@@ -42,8 +43,10 @@ class MultiLoReFT(nn.Module):
         self.device = device
         if staging:
             self.trainable_stage = "shared"
+            self.stage_switches = []
         else:
             self.trainable_stage = "joint"
+            self.stage_switches = [(0,0)]
         self.stage_tracking = {
                 "best_val_loss": 5000,
                 "best_val_MI_loss": 5000,
@@ -52,6 +55,7 @@ class MultiLoReFT(nn.Module):
             }
         self.verbose = verbose
         self.wandb_log = wandb_log
+        self.intervene_layer = intervene_layer
         
         # Initialize projection matrices
         self.R_s = nn.Parameter(torch.empty(shared_rank, max(input_dims[0], input_dims[1]), dtype=torch.float32))
@@ -114,34 +118,38 @@ class MultiLoReFT(nn.Module):
         else:  # joint 
             return list(self.parameters())
     
-    def prune_singular_values(self):
+    def prune_singular_values(self, single=False):
         """Prune singular values below threshold and update network weights."""
         def prune_matrix(name, R, weights_to_prune):
             U, S, V = torch.svd(R)
             if len(S) < 2:
                 return R, len(S)
             
-            # Original code that removes one at a time
-            min_sv_idx = torch.argmin(S)
-            min_sv = S[min_sv_idx]
-            if min_sv > self.pruning_threshold:
-                return R, len(S)
-            
-            # Create mask for keeping dimensions
-            keep_indices = torch.ones(R.shape[0], dtype=torch.bool)
-            keep_indices[:len(S)][min_sv_idx] = False
-            reduced_R = R[keep_indices, :]
-
-            # New code that removes all dimensions below threshold at once
-            # keep_indices = torch.ones(R.shape[0], dtype=torch.bool)
-            # keep_indices[:len(S)] = S >= self.pruning_threshold
-            
-            # if torch.all(keep_indices[:len(S)]):
-            #     return R, len(S)
+            if single:
+                # Original code that removes one at a time
+                min_sv_idx = torch.argmin(S)
+                min_sv = S[min_sv_idx]
+                if min_sv > self.pruning_threshold:
+                    return R, len(S)
                 
-            # reduced_R = R[keep_indices, :]
+                # Create mask for keeping dimensions
+                keep_indices = torch.ones(R.shape[0], dtype=torch.bool)
+                keep_indices[:len(S)][min_sv_idx] = False
+                reduced_R = R[keep_indices, :]
+            else:
+                keep_indices = torch.ones(R.shape[0], dtype=torch.bool)
+                below_threshold = S < self.pruning_threshold
+                num_below = below_threshold.sum().item()
+                if num_below == 0:
+                    return R, len(S)
+                # Calculate number to remove (between 1-10% of matrix size)
+                n_remove = max(1, min(num_below, int(0.1 * len(S))))
+                # Get indices of n smallest singular values
+                smallest_n_idx = torch.argsort(S)[:n_remove]
+                keep_indices[:len(S)][smallest_n_idx] = False
+                reduced_R = R[keep_indices, :]
             
-            # # Update weight networks
+            # Update weight networks
             for weight_seq in weights_to_prune:
                 last_layer = weight_seq[-1]
                 in_features = last_layer.in_features
@@ -153,7 +161,7 @@ class MultiLoReFT(nn.Module):
             # Update parameter
             del self._parameters[name]
             self.register_parameter(name, nn.Parameter(reduced_R))
-            print(f">>>>>>>>>>>>>>>>>> Pruned %s to %d dimensions "%(name, len(reduced_R)))
+            #print(f">>>>>>>>>>>>>>>>>> Pruned %s to %d dimensions "%(name, len(reduced_R)))
             return getattr(self, name), keep_indices.sum().item()
         
         # Prune each matrix
@@ -173,21 +181,7 @@ class MultiLoReFT(nn.Module):
     def update_optimizer(self, optimizer):
         optimizer.param_groups[0].update({"params": self.get_trainable_parameters()})
         return optimizer   
-    # def update_optimizer(self, optimizer):
-    #     """Update optimizer after pruning."""
-    #     return torch.optim.Adam(self.parameters(), lr=optimizer.param_groups[0]["lr"])
     
-    # def forward(self, embeddings):
-    #     """Performing the representation fine-tuning."""
-    #     h1, h2 = embeddings[0], embeddings[1]
-    #     # Compute projections
-    #     h1_out = h1 + (self.W_s0(h1) - F.linear(h1, self.R_s.T)) @ self.R_s + (self.W_m0(h1) - F.linear(h1, self.R_m1.T)) @ self.R_m1
-    #     h2_out = h2 + (self.W_s1(h2) - F.linear(h2, self.R_s.T)) @ self.R_s + (self.W_m1(h2) - F.linear(h2, self.R_m2.T)) @ self.R_m2
-    #     # h1_out = h1 + torch.matmul((self.W_s0(h1) - torch.matmul(h1, self.R_s.T)), self.R_s) + \
-    #     #          torch.matmul((self.W_m0(h1) - torch.matmul(h1, self.R_m1.T)), self.R_m1)
-    #     # h2_out = h2 + torch.matmul((self.W_s1(h2) - torch.matmul(h2, self.R_s.T)), self.R_s) + \
-    #     #          torch.matmul((self.W_m1(h2) - torch.matmul(h2, self.R_m2.T)), self.R_m2)
-    #     return h1_out, h2_out
     def forward(self, embeddings):
         h1 = F.normalize(embeddings[0], p=2, dim=-1)
         h2 = F.normalize(embeddings[1], p=2, dim=-1)
@@ -226,8 +220,6 @@ class MultiLoReFT(nn.Module):
         # Decouple representations
         for i, phi in enumerate(phis):
             if full:
-                # zs = torch.matmul(phi, self.R_s.T)
-                # zm = torch.matmul(phi, (self.R_m1.T if i==0 else self.R_m2.T))
                 zs = F.linear(phi, self.R_s)
                 zm = F.linear(phi, (self.R_m1 if i==0 else self.R_m2))
             else:
@@ -236,30 +228,48 @@ class MultiLoReFT(nn.Module):
             rep_components.append((zm, zs))
         
         return rep_components
+    
+    def fuse_representations(self, phis):
+        """Fuse representations."""
+        zs1 = F.linear(phis[0], self.R_s)
+        zm1 = F.linear(phis[1], (self.R_m1 if i==0 else self.R_m2))
+        zs2 = F.linear(phis[1], self.R_s)
+        zm2 = F.linear(phis[0], (self.R_m1 if i==0 else self.R_m2))
+        # Choose zs1 or zs2 based on a binary random sample
+        random_zs = zs1 if torch.randint(0, 2, (1,)).item() == 0 else zs2
+        return torch.cat((zm1, zm2, random_zs), dim=-1)
 
     def compute_stage_losses(self, h1, h2, z_components):
         # Compute all losses
-        l_shared = loss_shared_consistency(z_components[0][1], z_components[1][1])
-        l_orthogonal = loss_orthogonality(self.R_s, self.R_m1, self.R_m2)
-        l_mi = loss_mutual_info(h1, h2, z_components)
+        #l_shared = loss_shared_consistency(z_components[0][1], z_components[1][1])
+        #l_orthogonal = loss_orthogonality(self.R_s, self.R_m1, self.R_m2)
+        #l_mi = loss_mutual_info(h1, h2, z_components)
+        l_orthogonal = loss_independence(z_components[0][1], z_components[1][1], z_components[0][0], z_components[1][0])
+        l_mi = loss_mutual_info(h1, h2, z_components, all=False if self.trainable_stage == "shared" else True)
         
-        all_losses = [l_shared.item(), l_orthogonal.item(), l_mi.item()]
-        all_loss_names = ["Shared Loss", "Orthogonal Loss", "Mutual Info Loss"]
+        #all_losses = [l_shared.item(), l_orthogonal.item(), l_mi.item()]
+        #all_loss_names = ["Shared Loss", "Orthogonal Loss", "Mutual Info Loss"]
+        all_losses = [l_orthogonal.item(), l_mi.item()]
+        all_loss_names = ["Orthogonal Loss", "Mutual Info Loss"]
         
         # Return appropriate losses based on stage
         if self.trainable_stage == "shared":
-            return [l_shared, l_mi], ["Shared Loss", "Mutual Info Loss"], all_losses, all_loss_names
+            #return [l_shared, l_mi], ["Shared Loss", "Mutual Info Loss"], all_losses, all_loss_names
+            return [l_mi], ["Mutual Info Loss"], all_losses, all_loss_names
         elif self.trainable_stage == "private":
-            return [l_orthogonal, l_mi, l_shared], ["Orthogonal Loss", "Mutual Info Loss", "Shared Loss"], all_losses, all_loss_names
+            #return [l_orthogonal, l_mi, l_shared], ["Orthogonal Loss", "Mutual Info Loss", "Shared Loss"], all_losses, all_loss_names
+            return [l_orthogonal, l_mi], ["Orthogonal Loss", "Mutual Info Loss"], all_losses, all_loss_names
         elif self.trainable_stage == "joint":
-            return [l_orthogonal, l_shared, l_mi], ["Orthogonal Loss", "Shared Loss", "Mutual Info Loss"], all_losses, all_loss_names
+            #return [l_orthogonal, l_shared, l_mi], ["Orthogonal Loss", "Shared Loss", "Mutual Info Loss"], all_losses, all_loss_names
+            return [l_orthogonal, l_mi], ["Orthogonal Loss", "Mutual Info Loss"], all_losses, all_loss_names
         else:
             raise ValueError(f"Unknown training stage: {self.trainable_stage}")
 
-    def evaluate_validation_loss(self, val_dataloader):
+    def evaluate_validation_loss(self, val_dataloader, **kwargs):
         """Evaluate model on validation set."""
         val_total_loss = 0
-        val_loss_list = [0]*3
+        #val_loss_list = [0]*3
+        val_loss_list = None
         loss_balancer = GradientNormalizedLoss(num_losses=3)
         self.eval()
         with torch.no_grad():
@@ -270,15 +280,14 @@ class MultiLoReFT(nn.Module):
                     x1 = (x1).to(self.device)
                     x2 = (x2).to(self.device)
                     # This needs to be customized
-                    tokens_en = BertTokenizer.from_pretrained('bert-base-uncased')(x2, return_tensors="pt", padding=True, truncation=True).to(self.device)
-                    tokens_fr = AutoTokenizer.from_pretrained("sentence-transformers/LaBSE")(x2, padding=True, truncation=True, return_tensors="pt").to(self.device)
-                    with torch.no_grad():
-                        model_output = self.encoders[2](**tokens_fr)
-                        embeddings_fr = model_output.last_hidden_state[:, 0, :].to(self.device)
-                        model_output = self.encoders[1](**tokens_en)
-                        embeddings_en = model_output.last_hidden_state[:, 0, :].to(self.device)
-                        h1 = self.encoders[0].forward_features(x1)[:, 0, :].to(self.device)
-                        h2 = torch.where(label.unsqueeze(1).expand(-1, embeddings_en.size(1)) == 0, embeddings_en, embeddings_fr)
+                    tokens_en = en_tokenizer(x2, return_tensors="pt", padding=True, truncation=True).to(device)
+                    tokens_fr = fr_tokenizer(x2, padding=True, truncation=True, return_tensors="pt").to(device)
+                    model_output = self.encoders[2](**tokens_fr)
+                    embeddings_fr = model_output.last_hidden_state[:, 0, :].to(self.device)
+                    model_output = self.encoders[1](**tokens_en)
+                    embeddings_en = model_output.last_hidden_state[:, 0, :].to(self.device)
+                    h1 = self.encoders[0].forward_features(x1)[:, 0, :].to(self.device)
+                    h2 = torch.where(label.unsqueeze(1).expand(-1, embeddings_en.size(1)) == 0, embeddings_en, embeddings_fr)
                 else:
                     h1, h2, x1, x2, label = val_batch
                     if self.dataset_name == "flickr":
@@ -299,8 +308,9 @@ class MultiLoReFT(nn.Module):
                 losses_list, _, all_losses_list, _ = self.compute_stage_losses(h1, h2, z_components)
                 val_loss = torch.stack(losses_list).mean()
                 val_total_loss += val_loss.item()
-                for i, loss in enumerate(all_losses_list):
-                    val_loss_list[i] += loss
+                if val_loss_list is None:
+                    val_loss_list = np.zeros(len(all_losses_list))
+                val_loss_list += np.array(all_losses_list)
         self.train() 
         val_loss_list = [loss / len(val_dataloader) for loss in val_loss_list]
         return val_total_loss / len(val_dataloader), val_loss_list
@@ -322,7 +332,7 @@ class MultiLoReFT(nn.Module):
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
         return scheduler
 
-    def train_projection(self, dataloader, val_dataloader, early_stopping_config, hyperparameters=None, lr=1e-3, epochs=100, exp_name="projection_module"):#save_path="./ckpts/projection_module.pth"):
+    def train_projection(self, dataloader, val_dataloader, early_stopping_config, hyperparameters=None, lr=1e-3, epochs=100, exp_name="projection_module", warmup=100, **kwargs):#save_path="./ckpts/projection_module.pth"):
         """Train the projection model with early stopping."""
         save_path='./ckpts/%s.pth'%(exp_name)
         if self.verbose:
@@ -333,13 +343,14 @@ class MultiLoReFT(nn.Module):
         all_epoch_losses = []
         all_epoch_stages = []
         trainable_params = self.get_trainable_parameters()
-        optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-4)
+        optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-3)
         scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
         
         # Training loop
         for epoch in range(epochs):
             total_loss = 0
-            epoch_losses = np.zeros(3)
+            #epoch_losses = np.zeros(3)
+            epoch_losses = np.zeros(2)
 
             if self.wandb_log:
                 val_loss, val_logs, val_log_names = evaluate_validation_loss(self, val_dataloader, self.device)
@@ -366,16 +377,14 @@ class MultiLoReFT(nn.Module):
                     label = label.to(self.device)
                     x1 = (x1).to(self.device)
                     x2 = (x2).to(self.device)
-                    # This needs to be customized
-                    tokens_en = BertTokenizer.from_pretrained('bert-base-uncased')(x2, return_tensors="pt", padding=True, truncation=True).to(device)
-                    tokens_fr = AutoTokenizer.from_pretrained("sentence-transformers/LaBSE")(x2, padding=True, truncation=True, return_tensors="pt").to(device)
-                    with torch.no_grad():
-                        model_output = self.encoders[2](**tokens_fr)
-                        embeddings_fr = model_output.last_hidden_state[:, 0, :].to(self.device)
-                        model_output = self.encoders[1](**tokens_en)
-                        embeddings_en = model_output.last_hidden_state[:, 0, :].to(self.device)
-                        h1 = self.encoders[0].forward_features(x1)[:, 0, :].to(self.device)
-                        h2 = torch.where(label.unsqueeze(1).expand(-1, embeddings_en.size(1)) == 0, embeddings_en, embeddings_fr)
+                    tokens_en = en_tokenizer(x2, return_tensors="pt", padding=True, truncation=True).to(device)
+                    tokens_fr = fr_tokenizer(x2, padding=True, truncation=True, return_tensors="pt").to(device)
+                    model_output = self.encoders[2](**tokens_fr)
+                    embeddings_fr = model_output.last_hidden_state[:, 0, :].to(self.device)
+                    model_output = self.encoders[1](**tokens_en)
+                    embeddings_en = model_output.last_hidden_state[:, 0, :].to(self.device)
+                    h1 = self.encoders[0].forward_features(x1)[:, 0, :].to(self.device)
+                    h2 = torch.where(label.unsqueeze(1).expand(-1, embeddings_en.size(1)) == 0, embeddings_en, embeddings_fr)
                 else:
                     h1, h2, x1, x2, label = batch
                     if self.dataset_name == "flickr":
@@ -390,9 +399,10 @@ class MultiLoReFT(nn.Module):
                 #h2 = F.normalize(h2.float(), dim=1).to(self.device)
                 h1 = h1.to(self.device)
                 h2 = h2.to(self.device)
-                phis = self.forward([h1, h2])
+                #phis = self.forward([h1, h2])
                 
-                z_components = self.decouple(phis, full=True)
+                #z_components = self.decouple(phis, full=True)
+                z_components = self.decouple([h1, h2], full=True)
                 losses_list, loss_names, all_losses, all_loss_names = self.compute_stage_losses(h1, h2, z_components)
                 
                 losses = torch.stack(losses_list)
@@ -411,10 +421,10 @@ class MultiLoReFT(nn.Module):
             all_epoch_stages.append(self.trainable_stage)
             scheduler.step()
             
-            val_loss, val_loss_list = self.evaluate_validation_loss(val_dataloader)
+            val_loss, val_loss_list = self.evaluate_validation_loss(val_dataloader, **kwargs)
             if self.pruning:
                 # Prune if in joint stage
-                if self.trainable_stage == "joint" and val_loss_list[2] <= self.stage_tracking['best_val_MI_loss']*1.05 and epoch>40:
+                if self.trainable_stage == "joint" and val_loss_list[-1] <= self.stage_tracking['best_val_MI_loss']*1.05 and epoch>self.stage_switches[-1][-1]+10 and epoch > warmup:
                     self.prune_singular_values()
                     optimizer = self.update_optimizer(optimizer)
                     scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
@@ -428,8 +438,8 @@ class MultiLoReFT(nn.Module):
                 
                 if val_loss<self.stage_tracking["best_val_loss"]:
                     self.stage_tracking["best_val_loss"] = val_loss
-                if val_loss_list[2] < self.stage_tracking["best_val_MI_loss"]:
-                    self.stage_tracking["best_val_MI_loss"] = val_loss_list[2]
+                if val_loss_list[-1] < self.stage_tracking["best_val_MI_loss"]:
+                    self.stage_tracking["best_val_MI_loss"] = val_loss_list[-1]
                 
                 # Update tracking metrics
                 if relative_improvement > stage_config["min_improvement_ratio"]:
@@ -452,6 +462,7 @@ class MultiLoReFT(nn.Module):
                         print(f"***** [Epoch {epoch}] → Switched to PRIVATE stage after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
                     elif self.trainable_stage == "private":
                         self.trainable_stage = "joint"
+                        self.stage_tracking["best_val_MI_loss"] = 5000
                         self.stage_switches.append(('joint', epoch))
                         print(f"***** [Epoch {epoch}] → Switched to JOINT stage after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
                     # trainable_params = self.get_trainable_parameters()

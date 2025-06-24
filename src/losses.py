@@ -82,14 +82,18 @@ def loss_reconstruction(h, x, decoder):
     """Compute reconstruction loss between input and decoded representation."""
     return F.l1_loss(x, decoder(h))
 
-def loss_mutual_info(h1, h2, z_components):
+def loss_mutual_info(h1, h2, z_components, all=True):
     """
     Maximize mutual information between original and projected representations.
     Supports mismatched dimensions by projecting to a common space.
     """
     # Concatenate modality-specific and shared components
-    z1 = torch.cat([z_components[0][0], z_components[0][1]], dim=1)
-    z2 = torch.cat([z_components[1][0], z_components[1][1]], dim=1)
+    if all:
+        z1 = torch.cat([z_components[0][0], z_components[1][1]], dim=1)
+        z2 = torch.cat([z_components[1][0], z_components[0][1]], dim=1)
+    else:
+        z1 = z_components[1][1]
+        z2 = z_components[0][1]
     
     # Normalize representations
     h1 = F.normalize(h1, dim=1)
@@ -256,3 +260,107 @@ def loss_reconstruction_m(x, z, decoder):
 
 def loss_reconstruction_m(x, z, decoder):
     """Compute reconstruction loss between input and decoded representation."""
+
+def _rbf_kernel(x: torch.Tensor, sigma: float = None, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Compute the RBF (Gaussian) kernel matrix.
+    """
+    N = x.shape[0]
+    x_norm = (x ** 2).sum(dim=1).view(N, 1)
+    dist_sq = x_norm + x_norm.T - 2 * (x @ x.T)
+
+    if sigma is None:
+        # Use median heuristic for bandwidth
+        dist = dist_sq.detach().clone()
+        dist = dist[~torch.eye(N, dtype=bool, device=x.device)]
+        sigma = torch.sqrt(torch.median(dist) + eps)
+
+    gamma = 1.0 / (2 * sigma ** 2 + eps)
+    K = torch.exp(-gamma * dist_sq)
+    return K
+
+def hsic_rbf(x: torch.Tensor, y: torch.Tensor, sigma_x: float = None, sigma_y: float = None, unbiased: bool = True) -> torch.Tensor:
+    """
+    HSIC with Gaussian RBF kernel.
+    
+    Args:
+        x: (N, d_x)
+        y: (N, d_y)
+        sigma_x: bandwidth for RBF kernel on x
+        sigma_y: bandwidth for RBF kernel on y
+        unbiased: whether to use unbiased estimator
+    
+    Returns:
+        Scalar HSIC value
+    """
+    N = x.shape[0]
+    assert N == y.shape[0], "x and y must have the same number of samples"
+
+    K = _rbf_kernel(x, sigma_x)
+    L = _rbf_kernel(y, sigma_y)
+
+    if unbiased:
+        K = K - torch.diag_embed(torch.diagonal(K, dim1=-2, dim2=-1))
+        L = L - torch.diag_embed(torch.diagonal(L, dim1=-2, dim2=-1))
+
+        hsic = torch.sum(K * L) / (N * (N - 3)) \
+             - 2 * torch.sum(K.sum(dim=0) * L.sum(dim=0)) / (N * (N - 2) * (N - 3)) \
+             + torch.sum(K) * torch.sum(L) / (N * (N - 1) * (N - 2) * (N - 3))
+    else:
+        H = torch.eye(N, device=x.device) - (1.0 / N) * torch.ones((N, N), device=x.device)
+        Kc = H @ K @ H
+        Lc = H @ L @ H
+        hsic = torch.trace(Kc @ Lc) / ((N - 1) ** 2)
+
+    return hsic
+
+def hsic(x, y, sigma_x=None, sigma_y=None):
+    """
+    Compute HSIC between two tensors.
+    Args:
+        x: [n, d1]
+        y: [n, d2]
+    Returns:
+        Scalar HSIC value.
+    """
+    n = x.size(0)
+    K = rbf_kernel(x, sigma_x) # NOT DEFINED
+    L = rbf_kernel(y, sigma_y)
+
+    H = torch.eye(n, device=x.device) - (1.0 / n) * torch.ones((n, n), device=x.device)
+    Kc = torch.mm(H, torch.mm(K, H))
+    Lc = torch.mm(H, torch.mm(L, H))
+    hsic_val = torch.trace(torch.mm(Kc, Lc)) / ((n - 1)**2)
+    return hsic_val
+
+def loss_independence(z_s1, z_s2, z_m1, z_m2):
+    """
+    Compute independence loss between shared and modality-specific representations.
+    """
+    return hsic_rbf(z_s1, z_m1) + hsic_rbf(z_s2, z_m2)+ hsic_rbf(z_m1, z_m2)
+
+
+def center_gram(gram):
+    """Center a Gram matrix."""
+    n = gram.size(0)
+    unit = torch.ones(n, n, device=gram.device)
+    identity = torch.eye(n, device=gram.device)
+    H = identity - unit / n
+    return torch.matmul(H, torch.matmul(gram, H))
+
+def linear_cka(z1, z2):
+    """
+    Compute linear CKA between two representations z1 and z2.
+    """
+    # Centered Gram matrices
+    K = center_gram(torch.matmul(z1, z1.T))
+    L = center_gram(torch.matmul(z2, z2.T))
+
+    # HSIC (Hilbert-Schmidt Independence Criterion)
+    hsic = torch.sum(K * L)
+
+    # Normalization
+    norm_K = torch.norm(K)
+    norm_L = torch.norm(L)
+
+    return hsic / (norm_K * norm_L + 1e-8)
