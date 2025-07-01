@@ -5,8 +5,7 @@ from PIL import Image
 # import clip
 import os
 import random
-# from transformers import AutoTokenizer, AutoModel
-import torchvision.transforms as transforms
+from utils import get_dino_preprocess
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from multimodal_projector import MultiLoReFT
@@ -16,16 +15,7 @@ import timm
 import sys
 
 
-def get_dino_preprocess(image_size=518):
-    return transforms.Compose([
-        transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(image_size),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        ),
-    ])
+
 
 class Multi30KMixedLangDataset(Dataset):
     def __init__(self, split='train', device='cuda', embedding_cache_dir="/data/stonekab/cached_flickr_feats"):
@@ -59,18 +49,15 @@ class Multi30KMixedLangDataset(Dataset):
         lang_idx = random.choice([0, 1])  # 0 = English, 1 = French
         caption = caption_en if lang_idx == 0 else caption_fr
         text_feat = F.normalize(cached["text_feat_en"] if lang_idx == 0 else cached["text_feat_fr"], dim=0)
+        other_text_feat = F.normalize(cached["text_feat_fr"] if lang_idx == 0 else cached["text_feat_en"], dim=0)
 
         image_feat = F.normalize(cached["image_feat"], dim=0)
 
         # Return: h1 (image emb), h2 (text emb), x1 (raw image), x2 (caption str), label (0 or 1)
-        return image_feat.to(self.device), [cached["text_feat_en"].to(self.device), cached["text_feat_fr"].to(self.device)], image.to(self.device), [caption_en, caption_fr], lang_idx
+        return image_feat, [cached["text_feat_en"], cached["text_feat_fr"]], image, [caption_en, caption_fr], lang_idx
 
 
 if __name__ == "__main__":
-    # log_file = open("flickr_train.log", "w")
-    # sys.stdout = log_file
-    # sys.stderr = log_file  # Optional: also log errors
-
     print("CUDA available:", torch.cuda.is_available())
     if torch.cuda.is_available():
         print("Current device:", torch.cuda.current_device())
@@ -79,10 +66,11 @@ if __name__ == "__main__":
         print("Running on CPU")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    
     # Create train/val/test splits
-    train_dataset = Multi30KMixedLangDataset(split="train", device=device)
-    train_dataset = torch.utils.data.Subset(train_dataset, range(5000))
-    val_dataset = Multi30KMixedLangDataset(split="validation", device=device)
+    train_dataset = Multi30KMixedLangDataset(split="train")
+    # train_dataset = torch.utils.data.Subset(train_dataset, range(5000))
+    val_dataset = Multi30KMixedLangDataset(split="validation")
     # test_dataset = Multi30KMixedLangDataset(split="test", device=device)
 
     print(f"Train size: {len(train_dataset)}")
@@ -103,7 +91,7 @@ if __name__ == "__main__":
 
     projection_model = MultiLoReFT(
         input_dims=[768,768], 
-        shared_rank=1000, 
+        shared_rank=768, 
         specific_rank=768, 
         pruning_threshold=0.2,
         device=device,
@@ -112,34 +100,16 @@ if __name__ == "__main__":
         dataset_name="flickr"
     ).to(device)
     
-
-    # for image_feats, text_feats, images, captions, labels in train_dataloader:
-    #     print("Image features:", image_feats.shape)  # (B, D)
-    #     print("Text features:", text_feats.shape)    # (B, D)  )
-    #     print(labels)
-    #     print("Caption:", captions[0])  
-    #     # Display first image in batch
-    #     plt.figure(figsize=(10,10))
-    #     img = images[0].permute(1,2,0).cpu().numpy()
-    #     # Denormalize image
-    #     img = (img * 0.5) + 0.5
-    #     plt.imshow(img)
-    #     plt.axis('off')
-    #     plt.savefig('./plots/test.png')
-    #     plt.show()
-    #     break
-    # Train model
-        # Early stopping configuration
     early_stopping_config = {
         "shared": {
             "patience": 50,
             "min_improvement_ratio": 0.001,
-            "max_epochs": 60
+            "max_epochs": 100
         },
         "private": {
             "patience": 50,
             "min_improvement_ratio": 0.001,
-            "max_epochs": 60
+            "max_epochs": 100
         },
         "joint": {
             "patience": 50,
