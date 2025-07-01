@@ -227,9 +227,9 @@ class MultiLoReFT(nn.Module):
     def fuse_representations(self, phis):
         """Fuse representations."""
         zs1 = F.linear(phis[0], self.R_s)
-        zm1 = F.linear(phis[1], (self.R_m1 if i==0 else self.R_m2))
+        zm1 = F.linear(phis[0], self.R_m1)
         zs2 = F.linear(phis[1], self.R_s)
-        zm2 = F.linear(phis[0], (self.R_m1 if i==0 else self.R_m2))
+        zm2 = F.linear(phis[1], self.R_m2)
         # Choose zs1 or zs2 based on a binary random sample
         random_zs = zs1 if torch.randint(0, 2, (1,)).item() == 0 else zs2
         return torch.cat((zm1, zm2, random_zs), dim=-1)
@@ -277,14 +277,18 @@ class MultiLoReFT(nn.Module):
                     h1 = self.encoders[0].forward_features(x1)[:, 0, :].to(self.device)
                     h2 = torch.where(label.unsqueeze(1).expand(-1, embeddings_en.size(1)) == 0, embeddings_en, embeddings_fr)
                 else:
-                    h1, h2, x1, x2, label = val_batch
                     if self.dataset_name == "flickr":
                         # Generate random binary labels for each item in batch
-                        lang_idx = torch.randint(0, 2, (len(h1),), device=self.device)
+                        h1 = val_batch[0]
+                        h2 = val_batch[1]
+                        lang_idx = torch.randint(0, 2, (len(h1),), device=h1[0].device)
                         # Use the labels to select language for each item
                         h2 = torch.stack([h2[0], h2[1]], dim=1).gather(1, lang_idx.unsqueeze(1).unsqueeze(2).expand(-1, -1, h2[0].shape[-1])).squeeze(1)
-                        x2 = [x2[0][i] if idx == 0 else x2[1][i] for i, idx in enumerate(lang_idx)]
-                        label = lang_idx
+                        # x2 = [x2[0][i] if idx == 0 else x2[1][i] for i, idx in enumerate(lang_idx)]
+                        # label = lang_idx
+                    else:
+                        h1 = val_batch[0]
+                        h2 = val_batch[1]
                 
                 h1 = F.normalize(h1.float(), dim=1).to(self.device)
                 h2 = F.normalize(h2.float(), dim=1).to(self.device)
@@ -299,9 +303,9 @@ class MultiLoReFT(nn.Module):
                 val_total_loss += val_loss.item()
                 # Return both total loss and average loss list
                 val_loss_list += all_losses_list
+                torch.cuda.empty_cache()
         if self.encoders is not None:
             del model_output, embeddings_en, embeddings_fr
-        torch.cuda.empty_cache()
         self.train()
         
         # Average the losses over batches
@@ -347,14 +351,18 @@ class MultiLoReFT(nn.Module):
                         h1 = self.encoders[0].forward_features(x1)[:, 0, :].to(self.device)
                         h2 = torch.where(label.unsqueeze(1).expand(-1, embeddings_en.size(1)) == 0, embeddings_en, embeddings_fr)
                 else:
-                    h1, h2, x1, x2, label = batch
                     if self.dataset_name == "flickr":
                         # Generate random binary labels for each item in batch
-                        lang_idx = torch.randint(0, 2, (len(h1),), device=self.device)
+                        h1 = batch[0]
+                        h2 = batch[1]
+                        lang_idx = torch.randint(0, 2, (len(h1),)).to(h1[0].device)
                         # Use the labels to select language for each item
                         h2 = torch.stack([h2[0], h2[1]], dim=1).gather(1, lang_idx.unsqueeze(1).unsqueeze(2).expand(-1, -1, h2[0].shape[-1])).squeeze(1)
-                        x2 = [x2[0][i] if idx == 0 else x2[1][i] for i, idx in enumerate(lang_idx)]
-                        label = lang_idx
+                        # x2 = [x2[0][i] if idx == 0 else x2[1][i] for i, idx in enumerate(lang_idx)]
+                        # label = lang_idx
+                    else:
+                        h1 = batch[0]
+                        h2 = batch[1]
                 
                 h1 = F.normalize(h1.float(), dim=1).to(self.device)
                 h2 = F.normalize(h2.float(), dim=1).to(self.device)
@@ -372,6 +380,8 @@ class MultiLoReFT(nn.Module):
                 
                 total_loss += loss.item()
                 epoch_losses += all_losses
+                del  h1, h2, phis, z_components
+                torch.cuda.empty_cache()
             
             # Update metrics
             epoch_losses = epoch_losses / len(dataloader)
@@ -448,7 +458,6 @@ class MultiLoReFT(nn.Module):
                     f"plateau={self.stage_tracking['plateau_counter']}/{stage_config['patience']}, "
                     f"epochs={self.stage_tracking['min_epochs_counter']}/{stage_config['max_epochs']}")
             self.save_checkpoint(optimizer, epoch, loss, filepath=save_path)
-            print(self.R_s.shape, self.R_m1.shape, self.R_m2.shape)
         
             # Plot final losses
             plot_losses(np.array(all_epoch_losses), loss_names=all_loss_names, save_path="./plots/%s_loss_curves.pdf"%(exp_name), log_path="./logs/%s_loss_curves.csv"%(exp_name), stage_switches=self.stage_switches)

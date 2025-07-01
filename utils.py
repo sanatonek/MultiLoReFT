@@ -6,10 +6,48 @@ import numpy as np
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, accuracy_score, roc_auc_score
+import torchvision.transforms as transforms
+from skorch import NeuralNetRegressor
+
 
 import matplotlib.pyplot as plt
 import seaborn as sns
 sns.set() 
+
+class MultiHeadRegressor(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+def get_multihead_regressor(input_dim, output_dim, device='cpu'):
+    return NeuralNetRegressor(
+        module=MultiHeadRegressor,
+        module__input_dim=input_dim,
+        module__output_dim=output_dim,
+        max_epochs=20,
+        lr=1e-3,
+        device=device,
+        verbose=0,
+    )
+
+def get_dino_preprocess(image_size=518):
+    return transforms.Compose([
+        transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(image_size),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        ),
+    ])
+
 
 def _patch_linear_layer(layer, new_out_features):
     in_features = layer.in_features
@@ -90,16 +128,29 @@ class SklearnTrainer:
             y_train, y_val = y[train_idx], y[val_idx]
 
             scaler = StandardScaler().fit(X_train)
-            X_train = scaler.transform(X_train)
-            X_val = scaler.transform(X_val)
+            X_train = scaler.transform(X_train).squeeze()
+            X_val = scaler.transform(X_val).squeeze()
 
-            self.model.fit(X_train, y_train)
+            if self.task_type == "neural_multihead":
+                scaler_y = StandardScaler().fit(y_train)
+                y_train = y_train.squeeze()
+                y_val = y_val.squeeze()
+                y_train = scaler_y.transform(y_train)
+                y_val = scaler_y.transform(y_val)
+                input_dim = X_train.shape[1]
+                output_dim = y_train.shape[1] if y_train.ndim > 1 else 1
+                model = get_multihead_regressor(input_dim, output_dim)
+                model.fit(X_train.astype(np.float32), y_train.astype(np.float32))
+                preds = model.predict(X_val.astype(np.float32))
+                score = np.mean((preds - y_val) ** 2)  # MSE
 
-            if self.task_type == "regression":
+            elif self.task_type == "regression":
+                self.model.fit(X_train, y_train)
                 y_pred = self.model.predict(X_val)
                 score = mean_squared_error(y_val, y_pred)
 
             elif self.task_type == "binary":
+                self.model.fit(X_train, y_train)
                 # Binary classification: use probabilities if available
                 if hasattr(self.model, "predict_proba"):
                     y_pred = self.model.predict_proba(X_val)[:, 1]
@@ -108,6 +159,7 @@ class SklearnTrainer:
                 score = roc_auc_score(y_val, y_pred)
 
             elif self.task_type == "multiclass":
+                self.model.fit(X_train, y_train)
                 if hasattr(self.model, "predict_proba"):
                     y_pred = self.model.predict_proba(X_val)
                     score = roc_auc_score(y_val, y_pred, multi_class='ovr', average='macro')
