@@ -4,6 +4,45 @@ import torch.nn.functional as F
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.metrics import accuracy_score
 
+class SimilarityMLP(torch.nn.Module):
+    def __init__(self, dim1, dim2, hidden_dim=256):
+        super().__init__()
+        self.fc = torch.nn.Sequential(
+            torch.nn.Linear(dim1, dim2),
+        )
+    def forward(self, x1):
+        score = self.fc(x1)
+        return score
+
+def evaluate_cross_modal_retrieval(h0, h1, device, batch_size=512, similarity_model=None, k=10):
+    """
+    Batched version to evaluate cross-modal retrieval with learned similarity.
+    similarity_model: a model taking (query, gallery) → score
+    """
+    h0 = h0.to(device)
+    h1 = h1.to(device)
+    similarity_model = similarity_model.to(device)
+
+    def recall_at_k_batched(query_set, gallery_set, k=10):
+        correct_count = 0
+        num_samples = query_set.shape[0]
+
+        for start in range(0, num_samples, batch_size):
+            end = min(start + batch_size, num_samples)
+            batch_query = query_set[start:end]  # [B, Dq]
+            if batch_query.size(1) < gallery_set.size(1):
+                padding = torch.zeros(batch_query.size(0), gallery_set.size(1) - batch_query.size(1), device=batch_query.device)
+                batch_query = torch.cat((batch_query, padding), dim=1)
+            projected_query = similarity_model(batch_query)
+            sim_matrix = torch.nn.functional.cosine_similarity(projected_query.unsqueeze(1), gallery_set, dim=2)
+            topk = sim_matrix.topk(k, dim=1).indices
+            true_matches = torch.arange(start, end, device=device).unsqueeze(1)
+            correct = (topk == true_matches).any(dim=1).float()
+            correct_count += correct.sum().item()
+
+        return correct_count / num_samples
+    return recall_at_k_batched(h0, h1, k)
+
 def calc_corrs_and_ranks(model, threshold=0.05):
     # Get matrices above threshold
     Rs = model.R_s.detach().cpu().numpy()
