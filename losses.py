@@ -259,22 +259,30 @@ def loss_shared_consistency(z_s1, z_s2):
     # cos_similarity = 1 - F.cosine_similarity(z_s1, z_s2, dim=1)
     # return torch.mean(cos_similarity)
 
-def _rbf_kernel(x: torch.Tensor, sigma: float = None, eps: float = 1e-8) -> torch.Tensor:
+def rbf_kernel(x, sigma=None):
     """
-    Compute the RBF (Gaussian) kernel matrix.
+    Compute RBF (Gaussian) kernel matrix.
+    Args:
+        x: [n, d] tensor
+        sigma: scalar or None. If None, uses median heuristic.
+    Returns:
+        Kernel matrix [n, n]
     """
-    N = x.shape[0]
-    x_norm = (x ** 2).sum(dim=1).view(N, 1)
-    dist_sq = x_norm + x_norm.T - 2 * (x @ x.T)
-
+    n = x.size(0)
+    
+    # Compute pairwise squared Euclidean distances
+    x_norm = (x ** 2).sum(dim=1, keepdim=True)  # [n, 1]
+    dist_sq = x_norm + x_norm.t() - 2 * torch.mm(x, x.t())  # [n, n]
+    
+    # Median heuristic for sigma
     if sigma is None:
-        # Use median heuristic for bandwidth
-        dist = dist_sq.detach().clone()
-        dist = dist[~torch.eye(N, dtype=bool, device=x.device)]
-        sigma = torch.sqrt(torch.median(dist) + eps)
-
-    gamma = 1.0 / (2 * sigma ** 2 + eps)
-    K = torch.exp(-gamma * dist_sq)
+        # To avoid including diagonal (zero distances)
+        dists = dist_sq.detach().clone()
+        dists = dists[~torch.eye(n, dtype=torch.bool, device=x.device)]
+        sigma = torch.sqrt(0.5 * torch.median(dists))
+    
+    # Compute RBF kernel
+    K = torch.exp(-dist_sq / (2 * sigma ** 2))
     return K
 
 def hsic_rbf(x: torch.Tensor, y: torch.Tensor, sigma_x: float = None, sigma_y: float = None, unbiased: bool = True) -> torch.Tensor:
@@ -294,8 +302,8 @@ def hsic_rbf(x: torch.Tensor, y: torch.Tensor, sigma_x: float = None, sigma_y: f
     N = x.shape[0]
     assert N == y.shape[0], "x and y must have the same number of samples"
 
-    K = _rbf_kernel(x, sigma_x)
-    L = _rbf_kernel(y, sigma_y)
+    K = rbf_kernel(x, sigma_x)
+    L = rbf_kernel(y, sigma_y)
 
     if unbiased:
         K = K - torch.diag_embed(torch.diagonal(K, dim1=-2, dim2=-1))

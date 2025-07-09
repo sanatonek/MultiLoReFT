@@ -141,7 +141,7 @@ class MultiLoReFT(nn.Module):
                 if num_below == 0:
                     return R, len(S)
                 # Calculate number to remove (between 1-10% of matrix size)
-                n_remove = max(1, min(num_below, int(0.1 * len(S))))
+                n_remove = max(1, min(num_below, int(0.2 * len(S))))
                 # Get indices of n smallest singular values
                 smallest_n_idx = torch.argsort(S)[:n_remove]
                 keep_indices[:len(S)][smallest_n_idx] = False
@@ -238,19 +238,19 @@ class MultiLoReFT(nn.Module):
         # Compute all losses
         # l_shared = loss_shared_consistency(z_components[0][1], z_components[1][1])
         # l_orthogonal = loss_orthogonality(self.R_s, self.R_m1, self.R_m2)
-        l_orthogonal = loss_independence(z_components[0][1], z_components[1][1], z_components[0][0], z_components[1][0])
+        l_independence = loss_independence(z_components[0][1], z_components[1][1], z_components[0][0], z_components[1][0])
         l_mi = loss_mutual_info(h1, h2, z_components, all=False if self.trainable_stage == "shared" else True)
         
-        all_losses = [l_orthogonal.item(), l_mi.item()]
-        all_loss_names = ["Orthogonal Loss", "Mutual Info Loss"]
+        all_losses = [l_independence.item(), l_mi.item()]
+        all_loss_names = ["Independence Loss", "Mutual Info Loss"]
         
         # Return appropriate losses based on stage
         if self.trainable_stage == "shared":
             return [l_mi], ["Mutual Info Loss"], all_losses, all_loss_names
         elif self.trainable_stage == "private":
-            return [l_orthogonal, l_mi], ["Orthogonal Loss",  "Mutual Info Loss"], all_losses, all_loss_names
+            return [l_independence, l_mi], ["Independence Loss", "Mutual Info Loss"], all_losses, all_loss_names
         elif self.trainable_stage == "joint":
-            return [l_orthogonal, l_mi], ["Orthogonal Loss", "Mutual Info Loss"], all_losses, all_loss_names
+            return [l_independence, l_mi], ["Independence Loss", "Mutual Info Loss"], all_losses, all_loss_names
         else:
             raise ValueError(f"Unknown training stage: {stage}")
 
@@ -313,11 +313,11 @@ class MultiLoReFT(nn.Module):
         return val_total_loss / len(val_dataloader), val_loss_list
 
 
-    def train_projection(self, dataloader, val_dataloader, early_stopping_config, lr=1e-3, epochs=100, exp_name="projection_module", **kwargs):
+    def train_projection(self, dataloader, val_dataloader, early_stopping_config, dataset_name, lr=1e-3, epochs=100, exp_name="projection_module", **kwargs):
         """Train the projection model with early stopping."""
         # Create checkpoints directory if it doesn't exist
         os.makedirs("./ckpts", exist_ok=True)
-        os.makedirs("./plots", exist_ok=True)
+        os.makedirs("./plots/%s"%(self.dataset_name), exist_ok=True)
         os.makedirs("./logs", exist_ok=True)
         save_path='./ckpts/%s.pth'%(exp_name)
         print(f"Training on device: {self.device}")
@@ -364,8 +364,10 @@ class MultiLoReFT(nn.Module):
                         h1 = batch[0]
                         h2 = batch[1]
                 
-                h1 = F.normalize(h1.float(), dim=1).to(self.device)
-                h2 = F.normalize(h2.float(), dim=1).to(self.device)
+                # h1 = F.normalize(h1.float(), dim=1).to(self.device)
+                # h2 = F.normalize(h2.float(), dim=1).to(self.device)
+                h1 = h1.to(self.device)
+                h2 = h2.to(self.device)
                 phis = self.forward([h1, h2])
                 
                 z_components = self.decouple(phis, full=True)
@@ -391,7 +393,7 @@ class MultiLoReFT(nn.Module):
             val_loss, val_loss_list = self.evaluate_validation_loss(val_dataloader, **kwargs)
             if self.pruning:
                 # Prune if in joint stage
-                if self.trainable_stage == "joint" and (val_loss_list[-1] <= self.stage_tracking['best_val_MI_loss'] * 1.05) and epoch>self.stage_switches[-1][-1]+10 and epoch>100:  # Index 2 is MI loss based on all_loss_names, allow 5% margin
+                if self.trainable_stage == "joint" and (val_loss_list[-1] <= self.stage_tracking['best_val_MI_loss'] * 1.05) and epoch>self.stage_switches[-1][-1]+30 and epoch>100:  # Index 2 is MI loss based on all_loss_names, allow 5% margin
                     self.prune_singular_values()
                     optimizer = self.update_optimizer(optimizer, lr=lr)
                     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
@@ -460,7 +462,7 @@ class MultiLoReFT(nn.Module):
             self.save_checkpoint(optimizer, epoch, loss, filepath=save_path)
         
             # Plot final losses
-            plot_losses(np.array(all_epoch_losses), loss_names=all_loss_names, save_path="./plots/%s_loss_curves.pdf"%(exp_name), log_path="./logs/%s_loss_curves.csv"%(exp_name), stage_switches=self.stage_switches)
+            plot_losses(np.array(all_epoch_losses), loss_names=all_loss_names, save_path="./plots/%s/%s_loss_curves.pdf"%(dataset_name, exp_name), log_path="./logs/%s_loss_curves.csv"%(exp_name), stage_switches=self.stage_switches)
         self.save_checkpoint(optimizer, epoch, loss, filepath=save_path)
 
 
@@ -531,7 +533,7 @@ def main():
     
 
     # Train model
-    projection_model.train_projection(dataloader, val_dataloader, early_stopping_config, lr=1e-3, epochs=1000)
+    projection_model.train_projection(dataloader, val_dataloader, early_stopping_config, lr=1e-3, epochs=1000, dataset_name="simulated")
 
 
 if __name__ == "__main__":
