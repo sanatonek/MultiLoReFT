@@ -40,7 +40,7 @@ if __name__ == "__main__":
     print("Using device:", device)
 
     train_dataset = VQADataset(split="train")
-    train_dataset = torch.utils.data.Subset(train_dataset, range(5000))
+    train_dataset = torch.utils.data.Subset(train_dataset, range(8000))
     val_dataset = VQADataset(split="validation")
     val_dataset = torch.utils.data.Subset(val_dataset, range(1000))
 
@@ -76,6 +76,7 @@ if __name__ == "__main__":
         lr=1e-3,
         epochs=250,
         exp_name='vqa_model_all',
+        dataset_name="vqa",
         en_tokenizer=en_tokenizer,
         fr_tokenizer=None  # Not used for VQA
     )

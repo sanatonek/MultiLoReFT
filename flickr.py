@@ -69,7 +69,7 @@ if __name__ == "__main__":
     
     # Create train/val/test splits
     train_dataset = Multi30KMixedLangDataset(split="train")
-    # train_dataset = torch.utils.data.Subset(train_dataset, range(5000))
+    train_dataset = torch.utils.data.Subset(train_dataset, range(5000))
     val_dataset = Multi30KMixedLangDataset(split="validation")
     # test_dataset = Multi30KMixedLangDataset(split="test", device=device)
 
@@ -118,4 +118,4 @@ if __name__ == "__main__":
         }
     }
 
-    projection_model.train_projection(train_dataloader, val_dataloader, early_stopping_config, lr=1e-3, epochs=250, exp_name='flickr_model_all', en_tokenizer=en_tokenizer, fr_tokenizer=fr_tokenizer)#, save_path='./ckpts/flickr_model_staging.pth')
+    projection_model.train_projection(train_dataloader, val_dataloader, early_stopping_config, lr=1e-3, epochs=250, exp_name='flickr_model_all', dataset_name="flickr", en_tokenizer=en_tokenizer, fr_tokenizer=fr_tokenizer)#, save_path='./ckpts/flickr_model_staging.pth')
