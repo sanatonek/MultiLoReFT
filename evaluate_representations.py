@@ -21,7 +21,7 @@ import clip
 import timm
 from torchvision import transforms
 from transformers import BertTokenizer, BertModel
-from transformers import AutoTokenizer, AutoModel
+# from transformers import AutoTokenizer
 import argparse
 import random
 
@@ -50,46 +50,55 @@ def plot_closest_images(images_all, reference_image, closest_indices, filename):
     plt.savefig(filename)
     plt.close()
 
-def evaluate_cross_modal_retrieval(phis0, phis1, projector, device):
+class SimilarityMLP(torch.nn.Module):
+    def __init__(self, dim1, dim2, hidden_dim=256):
+        super().__init__()
+        self.fc = torch.nn.Sequential(
+            torch.nn.Linear(dim1, dim2),
+        )
+    def forward(self, x1):
+        score = self.fc(x1)
+        return score
+
+def evaluate_cross_modal_retrieval(h0, h1, device, batch_size=512, similarity_model=None, k=10):
     """
-    Evaluates cross-modal retrieval performance using cosine similarity.
-
-    Assumes:
-    - dataloader yields (h1, h2, x1, x2, l)
-    - projector(h1, h2) -> (phi1, phi2)
-    - h1: features from modality 1 (e.g., image)
-    - h2: features from modality 2 (e.g., text)
-
-    Returns:
-        dict with Recall@1, Recall@5, Recall@10 for both directions
+    Batched version to evaluate cross-modal retrieval with learned similarity.
+    similarity_model: a model taking (query, gallery) → score
     """
+    h0 = h0.to(device)
+    h1 = h1.to(device)
+    similarity_model = similarity_model.to(device)
 
-    # Compute similarity matrix
-    sim_matrix = phis0 @ phis1.T  # (N x N)
+    def recall_at_k_batched(query_set, gallery_set, k=10):
+        correct_count = 0
+        num_samples = query_set.shape[0]
 
-    def recall_at_k(sim_matrix, k, labels):
-        topk = sim_matrix.topk(k, dim=1).indices
-        
-        # For each query i, its true match is at index i
-        # Create a column vector of indices [0,1,2,...,N-1]
-        true_matches = torch.arange(sim_matrix.shape[0], device=sim_matrix.device).unsqueeze(1)
-        
-        # Check if true matching index appears in top k predictions
-        correct = (topk == true_matches).any(dim=1).float()
-        return correct.mean().item()
+        for start in range(0, num_samples, batch_size):
+            end = min(start + batch_size, num_samples)
+            batch_query = query_set[start:end]  # [B, Dq]
+            if batch_query.size(1) < gallery_set.size(1):
+                padding = torch.zeros(batch_query.size(0), gallery_set.size(1) - batch_query.size(1), device=batch_query.device)
+                batch_query = torch.cat((batch_query, padding), dim=1)
+            projected_query = similarity_model(batch_query)
+            sim_matrix = torch.nn.functional.cosine_similarity(projected_query.unsqueeze(1), gallery_set, dim=2)
 
-    results = {
-        'Image→Text R@1': recall_at_k(sim_matrix, 1, labels),
-        'Image→Text R@5': recall_at_k(sim_matrix, 5, labels),
-        'Image→Text R@10': recall_at_k(sim_matrix, 10, labels),
-        'Text→Image R@1': recall_at_k(sim_matrix.T, 1, labels),
-        'Text→Image R@5': recall_at_k(sim_matrix.T, 5, labels),
-        'Text→Image R@10': recall_at_k(sim_matrix.T, 10, labels),
-    }
+            # scores = []
+            # for i in range(gallery_set.shape[0]):
+            #     # gallery_item = gallery_set[i].unsqueeze(0).expand(batch_query.size(0), -1)  # [B, Dg]
+            #     score = similarity_model(batch_query, gallery_item).squeeze(-1)  # [B]
+            #     scores.append(score)
 
-    return results
+            # sim_matrix = torch.stack(scores, dim=1)  # [B, N]
+            topk = sim_matrix.topk(k, dim=1).indices
+            true_matches = torch.arange(start, end, device=device).unsqueeze(1)
+            correct = (topk == true_matches).any(dim=1).float()
+            correct_count += correct.sum().item()
 
-def evaluate_predictability(components, labels, task_name):
+        return correct_count / num_samples
+    return recall_at_k_batched(h0, h1, k)
+
+
+def evaluate_predictability(components, labels, task_name, dataset_name):
     """Evaluate how well each component (shared and modality-specific) can predict the target label.
     """
     
@@ -155,11 +164,11 @@ def evaluate_predictability(components, labels, task_name):
     plt.ylabel(f'Predictive Performance ({metric_name})')
     plt.title('Predictive Performance of Each Component')
     plt.tight_layout()
-    plt.savefig(f"plots/predictability_plot_{task_name}.png")
+    plt.savefig(f"plots/{dataset_name}/predictability_plot_{task_name}.png")
 
 
 
-def plot_representations(z_n, labels, task_name, save_dir="./plots"):
+def plot_representations(z_n, labels, task_name, dataset_name, save_dir="./plots"):
     """Plot 2D PCA projections of the representations colored by each label.
     
     Args:
@@ -193,7 +202,7 @@ def plot_representations(z_n, labels, task_name, save_dir="./plots"):
             # If no valid features, just write "No Data"
             ax.text(0.5, 0.5, "No Data", horizontalalignment='center', verticalalignment='center')
 
-        plt.savefig(f"{save_dir}/test_{task_name}.pdf")
+        plt.savefig(f"{save_dir}/{dataset_name}/test_{task_name}.pdf")
 
 
 def plot_projection_matrices(model, threshold=0.00, save_dir="./plots"):
@@ -421,14 +430,28 @@ def main():
         ("H1", h1),
         ("H2", h2)
     ] 
+    z1 = torch.concat([z1m, z1s], dim=1)
+    z2 = torch.concat([z2m, z2s], dim=1)
+    res = evaluate_cross_modal_retrieval(z1, h2, device, batch_size=256, similarity_model=SimilarityMLP(z1.shape[1], h2.shape[1]))
+    print("Recall@10 predicting caption from z1: ", res)
+    res = evaluate_cross_modal_retrieval(z2, h1, device, batch_size=256, similarity_model=SimilarityMLP(z2.shape[1], h1.shape[1]))
+    print("Recall@10 predicting image from z2: ", res)
+    res = evaluate_cross_modal_retrieval(phi_1, h2, device, batch_size=256, similarity_model=SimilarityMLP(phi_1.shape[1], h2.shape[1]))
+    print("Recall@10 predicting caption from phi1: ", res)
+    res = evaluate_cross_modal_retrieval(phi_2, h1, device, batch_size=256, similarity_model=SimilarityMLP(phi_2.shape[1], h1.shape[1]))
+    print("Recall@10 predicting image from phi2: ", res)
+    res = evaluate_cross_modal_retrieval(h1, h2, device, batch_size=256, similarity_model=SimilarityMLP(h1.shape[1], h2.shape[1]))
+    print("Recall@10 predicting caption from h1: ", res)
+    res = evaluate_cross_modal_retrieval(h2, h1, device, batch_size=256, similarity_model=SimilarityMLP(h2.shape[1], h1.shape[1]))
+    print("Recall@10 predicting image from h2: ", res)
     for name, z in components:
         print(name, z.shape)
     for task_ind, label_task in enumerate(prediction_labels):
         print(label_task.shape)
         label_task = label_task.squeeze()
         if label_task[0].numel() == 1:
-            plot_representations((z1m, z1s, z2m, z2s), label_task, task_names[task_ind])
-        evaluate_predictability(components, label_task, task_names[task_ind])
+            plot_representations((z1m, z1s, z2m, z2s), label_task, task_names[task_ind], dataset_name)
+        evaluate_predictability(components, label_task, task_names[task_ind], dataset_name)
     
     # Evaluate predictability for each label
 
