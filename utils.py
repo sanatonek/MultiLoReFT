@@ -5,9 +5,11 @@ import torch.optim as optim
 import numpy as np
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, accuracy_score, roc_auc_score
+from sklearn.metrics import mean_squared_error, accuracy_score, roc_auc_score, silhouette_score
+from sklearn.cluster import KMeans
 import torchvision.transforms as transforms
 from skorch import NeuralNetRegressor
+from sklearn.linear_model import LinearRegression, Lasso, LogisticRegression
 
 
 import matplotlib.pyplot as plt
@@ -59,13 +61,19 @@ def load_checkpoint(filepath, model, optimizer=None):
     state_dict = checkpoint["model_state_dict"]
 
     # Patch R_s and matching W_s0, W_s1
-    if "R_s" in state_dict:
-        new_rank = state_dict["R_s"].shape[0]
-        if model.R_s.shape[0] != new_rank:
-            print(f"Patching R_s → {new_rank}")
-            model.R_s = nn.Parameter(torch.empty_like(state_dict["R_s"]))
-            model.register_parameter("R_s", model.R_s)
+    if "R_s1" in state_dict:
+        new_rank = state_dict["R_s1"].shape[0]
+        if model.R_s1.shape[0] != new_rank:
+            print(f"Patching R_s1 → {new_rank}")
+            model.R_s1 = nn.Parameter(torch.empty_like(state_dict["R_s1"]))
+            model.register_parameter("R_s1", model.R_s1)
             model.W_s0[-1] = _patch_linear_layer(model.W_s0[-1], new_rank)
+    if "R_s2" in state_dict:
+        new_rank = state_dict["R_s2"].shape[0]
+        if model.R_s2.shape[0] != new_rank:
+            print(f"Patching R_s2 → {new_rank}")
+            model.R_s2 = nn.Parameter(torch.empty_like(state_dict["R_s2"]))
+            model.register_parameter("R_s2", model.R_s2)
             model.W_s1[-1] = _patch_linear_layer(model.W_s1[-1], new_rank)
 
     # Patch R_m1 and W_m0
@@ -122,6 +130,7 @@ class SklearnTrainer:
         """
         kf = KFold(n_splits=k, shuffle=True, random_state=42)
         all_scores = []
+        score_1 = None
 
         for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
             X_train, X_val = X[train_idx], X[val_idx]
@@ -145,11 +154,13 @@ class SklearnTrainer:
                 score = np.mean((preds - y_val) ** 2)  # MSE
 
             elif self.task_type == "regression":
+                self.model = LinearRegression()
                 self.model.fit(X_train, y_train)
                 y_pred = self.model.predict(X_val)
                 score = mean_squared_error(y_val, y_pred)
 
             elif self.task_type == "binary":
+                self.model = Lasso(alpha=0.1)
                 self.model.fit(X_train, y_train)
                 # Binary classification: use probabilities if available
                 if hasattr(self.model, "predict_proba"):
@@ -159,10 +170,13 @@ class SklearnTrainer:
                 score = roc_auc_score(y_val, y_pred)
 
             elif self.task_type == "multiclass":
+                self.model = LogisticRegression(max_iter=1000, solver='lbfgs')
                 self.model.fit(X_train, y_train)
                 if hasattr(self.model, "predict_proba"):
                     y_pred = self.model.predict_proba(X_val)
                     score = roc_auc_score(y_val, y_pred, multi_class='ovr', average='macro')
+                    kmeans = KMeans(n_clusters=np.unique(y_val).shape[0], random_state=42)
+                    score_1 = silhouette_score(X_val, kmeans.fit_predict(X_val))
                 else:
                     y_pred = self.model.predict(X_val)
                     score = accuracy_score(y_val, y_pred)
@@ -171,20 +185,23 @@ class SklearnTrainer:
                 raise ValueError(f"Unsupported task type: {self.task_type}")
 
             all_scores.append(score)
-
-        return np.mean(all_scores), np.var(all_scores)
+        if score_1 is not None:
+            return np.mean(all_scores), np.var(all_scores), np.mean(score_1), np.var(score_1)
+        else:
+            return np.mean(all_scores), np.var(all_scores)
     
 def plot_losses(losses, loss_names, save_path=None, log_path=None, stage_switches=None):
     """Plot loss curves in separate horizontal subplots and save loss values."""
     # Convert losses to numpy array if it's not already
-    losses = np.array(losses)
+    # losses = np.array(losses)
     
     # Calculate total loss
-    total_loss = np.sum(losses, axis=1)
+    # total_loss =np.sum(losses, axis=1)
     # all_losses = np.column_stack(losses)
-    all_losses = np.column_stack([losses, total_loss])
-    # all_names = loss_names #+ 
-    all_names = loss_names + ['Total Loss']
+    # all_losses = np.column_stack([losses, total_loss])
+    all_names = loss_names #+ 
+    all_losses = losses
+    # all_names = loss_names + ['Total Loss']
     
     # Create figure with subplots
     num_losses = len(all_names)
@@ -196,7 +213,7 @@ def plot_losses(losses, loss_names, save_path=None, log_path=None, stage_switche
     
     # Plot each loss in its own subplot
     for i, (ax, name) in enumerate(zip(axes, all_names)):
-        ax.plot(all_losses[:, i], label=name, linewidth=2)
+        ax.plot(all_losses[i, :], label=name, linewidth=2)
         ax.set_xlabel('Epoch')
         ax.set_ylabel('Loss Value')
         ax.set_title(name)
@@ -215,9 +232,9 @@ def plot_losses(losses, loss_names, save_path=None, log_path=None, stage_switche
         
         # Save loss values to CSV
         csv_path = log_path
-        import pandas as pd
-        df = pd.DataFrame(all_losses, columns=all_names)
-        df.to_csv(csv_path, index_label='epoch')
+        # import pandas as pd
+        # df = pd.DataFrame(all_losses, columns=all_names)
+        # df.to_csv(csv_path, index_label='epoch')
     else:
         plt.show()
 
