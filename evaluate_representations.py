@@ -15,6 +15,7 @@ from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.multioutput import MultiOutputRegressor
 from flickr import Multi30KMixedLangDataset
 from vqa import VQADataset
+from cremad import CremadDataset
 from sklearn.metrics import r2_score, accuracy_score
 from sklearn.multiclass import OneVsRestClassifier
 import clip
@@ -79,8 +80,12 @@ def evaluate_cross_modal_retrieval(h0, h1, device, batch_size=512, similarity_mo
             if batch_query.size(1) < gallery_set.size(1):
                 padding = torch.zeros(batch_query.size(0), gallery_set.size(1) - batch_query.size(1), device=batch_query.device)
                 batch_query = torch.cat((batch_query, padding), dim=1)
-            projected_query = similarity_model(batch_query)
-            sim_matrix = torch.nn.functional.cosine_similarity(projected_query.unsqueeze(1), gallery_set, dim=2)
+            elif batch_query.size(1) > gallery_set.size(1):
+                padding = torch.zeros(gallery_set.size(0), batch_query.size(1) - gallery_set.size(1), device=gallery_set.device)
+                gallery_set = torch.cat((gallery_set, padding), dim=1)
+            
+            # projected_query = similarity_model(batch_query)
+            sim_matrix = torch.nn.functional.cosine_similarity(batch_query.unsqueeze(1), gallery_set, dim=2)
 
             # scores = []
             # for i in range(gallery_set.shape[0]):
@@ -101,7 +106,6 @@ def evaluate_cross_modal_retrieval(h0, h1, device, batch_size=512, similarity_mo
 def evaluate_predictability(components, labels, task_name, dataset_name):
     """Evaluate how well each component (shared and modality-specific) can predict the target label.
     """
-    
     # Determine if this is a classification or regression task
     y = labels
     y = y.detach().cpu().numpy() if hasattr(y, "detach") else np.array(y)
@@ -114,42 +118,47 @@ def evaluate_predictability(components, labels, task_name, dataset_name):
         return
     
     # Determine task type based on both number of unique values and their nature
-    is_classification = (n_unique <= 10 and 
+    is_classification = (n_unique <= 20 and 
                         np.all(np.mod(y, 1) == 0))  # Check if all values are integers
     
     if is_classification:
         n_classes = len(np.unique(y))
-        print(f"Task type: Classification ({n_classes} classes)")
+        print(f"Predicting {task_name}: Classification ({n_classes} classes)")
 
         if n_classes == 2:
             model = Lasso(alpha=0.1)
-            metric_name = "roc_auc"
+            metric_name = ["roc_auc"]
             task_type = "binary"
         else:
-            model = OneVsRestClassifier(LogisticRegression(solver='liblinear'))
-            metric_name = "roc_auc_ovr"
+            model = LogisticRegression(max_iter=1000, solver='lbfgs')
+            metric_name = ["roc_auc_ovr", "silhouette_score"]
             task_type = "multiclass"
     else:
         if y.ndim > 1 and y.shape[1] > 1:
-            print(f"Task type: Multidimensional Regression ({y.shape[1]} dimensions)")
+            print(f"Predicting {task_name}: Multidimensional Regression ({y.shape[1]} dimensions)")
             model = None  # Not used for neural_multihead
             task_type = "neural_multihead"
-            metric_name = "MSE"
+            metric_name = ["MSE"]
         else:
-            print(f"Task type: Regression ({n_unique} unique values)")
+            print(f"Predicting {task_name}: Regression ({n_unique} unique values)")
             model = LinearRegression()
             task_type = "regression"
-            metric_name = "MSE"
+            metric_name = ["MSE"]
     
     performance_scores = []
     component_names = []
     for name, z in components:
         try:
             reg_model = SklearnTrainer(model=model, task_type=task_type)
-            score, score_var = reg_model.train_and_evaluate(z.detach().cpu(), y, k=5)
+            if task_type == "multiclass":
+                score, score_var, score_1, score_var_1 = reg_model.train_and_evaluate(z.detach().cpu(), y, k=5)
+            else:
+                score, score_var = reg_model.train_and_evaluate(z.detach().cpu(), y, k=5)
             performance_scores.append((score, score_var))
             component_names.append(name)
-            print(name, f"-----Predictive performance ({metric_name}): {score:.3f} (var: {score_var:.3f})")
+            print(name, f"-----Predictive performance of {task_name}: ({metric_name[0]}): {score:.3f} (var: {score_var:.3f})")
+            if task_type == "multiclass":
+                print(name, f"-----Predictive performance of {task_name}: ({metric_name[1]}): {score_1:.3f} (var: {score_var_1:.3f})")
         except Exception as e:
             print(f"Error evaluating {name}: {str(e)}")
             continue
@@ -160,15 +169,15 @@ def evaluate_predictability(components, labels, task_name, dataset_name):
 
     plt.figure(figsize=(10, 6))
     plt.bar(x_pos, scores, yerr=variances, align='center', alpha=0.7, capsize=10)
-    plt.xticks(x_pos, component_names, rotation=45, ha='right')
-    plt.ylabel(f'Predictive Performance ({metric_name})')
-    plt.title('Predictive Performance of Each Component')
+    plt.xticks(x_pos, component_names, rotation=45, ha='right', fontsize=16)
+    plt.ylabel(f'Predictive Performance ({metric_name})', fontsize=16)
+    plt.title('Predictive Performance of Each Component', fontsize=18)
     plt.tight_layout()
     plt.savefig(f"plots/{dataset_name}/predictability_plot_{task_name}.png")
 
 
 
-def plot_representations(z_n, labels, task_name, dataset_name, save_dir="./plots"):
+def plot_representations(z_n, labels, task_name, dataset_name, save_dir="./plots", modality_names=["A", "B"]):
     """Plot 2D PCA projections of the representations colored by each label.
     
     Args:
@@ -179,14 +188,14 @@ def plot_representations(z_n, labels, task_name, dataset_name, save_dir="./plots
     # for l_ind in range(len(labels[0])):
     fig, axs = plt.subplots(2, 2, figsize=(16, 16))    
     titles = [
-        ('Modality-specific A', 0, 0),
-        ('Shared A', 0, 1),
-        ('Modality-specific B', 1, 0),
-        ('Shared B', 1, 1)
+        (f'Modality-specific {modality_names[0]}', 0, 0),
+        (f'Shared {modality_names[0]}', 0, 1),
+        (f'Modality-specific {modality_names[1]}', 1, 0),
+        (f'Shared {modality_names[1]}', 1, 1)
     ]
     for title, i, j in titles:
         ax = axs[i, j]
-        ax.set_title(title)     
+        ax.set_title(title, fontsize=18)     
         data = z_n[i*2+j].detach().cpu().numpy()
         
         if data.shape[1] >= 2:
@@ -202,7 +211,8 @@ def plot_representations(z_n, labels, task_name, dataset_name, save_dir="./plots
             # If no valid features, just write "No Data"
             ax.text(0.5, 0.5, "No Data", horizontalalignment='center', verticalalignment='center')
 
-        plt.savefig(f"{save_dir}/{dataset_name}/test_{task_name}.pdf")
+    plt.savefig(f"{save_dir}/{dataset_name}/test_{task_name}.pdf")
+    print(f"Saved plot to {save_dir}/{dataset_name}/test_{task_name}.pdf")
 
 
 def plot_projection_matrices(model, threshold=0.00, save_dir="./plots"):
@@ -219,8 +229,10 @@ def plot_projection_matrices(model, threshold=0.00, save_dir="./plots"):
     # print("Modality-specific SVD: ", torch.linalg.svdvals(model.R_m2).detach().cpu().numpy())
     
     # Get matrices above threshold
-    shared_sv = torch.where(torch.linalg.svdvals(model.R_s) > threshold)
-    Rs = model.R_s[shared_sv].detach().cpu().numpy()
+    shared_sv = torch.where(torch.linalg.svdvals(model.R_s1) > threshold)
+    Rs_1 = model.R_s1[shared_sv].detach().cpu().numpy()
+    shared_sv = torch.where(torch.linalg.svdvals(model.R_s2) > threshold)
+    Rs_2 = model.R_s2[shared_sv].detach().cpu().numpy()
     m1_sv = torch.where(torch.linalg.svdvals(model.R_m1) > threshold)
     Rm1 = model.R_m1[m1_sv].detach().cpu().numpy()
     m2_sv = torch.where(torch.linalg.svdvals(model.R_m2) > threshold)
@@ -228,19 +240,21 @@ def plot_projection_matrices(model, threshold=0.00, save_dir="./plots"):
 
     # Plot matrices
     fig, axs = plt.subplots(1, 3, figsize=(18, 6))
-    matrices = [Rs, Rm1, Rm2]
-    titles = ["Shared Projection (R_s)", "Modality-Specific (R_m1)", "Modality-Specific (R_m2)"]
+    matrices = [Rs_1, Rs_2, Rm1, Rm2]
+    titles = ["Shared Projection (R_s1)", "Shared Projection (R_s2)", "Modality-Specific (R_m1)", "Modality-Specific (R_m2)"]
     
     # Find the maximum absolute value for symmetric color range
-    max_abs = max(abs(Rs).max(), abs(Rm1).max(), abs(Rm2).max())
+    max_abs = max(abs(Rs_1).max(), abs(Rs_2).max(), abs(Rm1).max(), abs(Rm2).max())
     vmin, vmax = -max_abs, max_abs
 
     # Plot matrices
     for ax, matrix, title in zip(axs, matrices, titles):
         sns.heatmap(matrix, ax=ax, cmap="RdBu_r", cbar=True, vmin=vmin, vmax=vmax, center=0)
         # Get the correct matrix based on title
-        if "Shared" in title:
-            sv = torch.linalg.svdvals(model.R_s).detach().cpu().numpy()
+        if "R_s1" in title:
+            sv = torch.linalg.svdvals(model.R_s1).detach().cpu().numpy()
+        elif "R_s2" in title:
+            sv = torch.linalg.svdvals(model.R_s2).detach().cpu().numpy()
         elif "R_m1" in title:
             sv = torch.linalg.svdvals(model.R_m1).detach().cpu().numpy()
         else:
@@ -253,11 +267,11 @@ def plot_projection_matrices(model, threshold=0.00, save_dir="./plots"):
 
     # Plot correlation heatmap
     fig, ax = plt.subplots(figsize=(8, 6))
-    names = ['R_s', 'R_m1', 'R_m2']
-    corr_matrix = np.zeros((3, 3))
+    names = ['R_s1', 'R_s2', 'R_m1', 'R_m2']
+    corr_matrix = np.zeros((4, 4))
     
-    for i in range(3):
-        for j in range(3):
+    for i in range(4):
+        for j in range(4):
             flat_i = matrices[i].flatten()
             flat_j = matrices[j].flatten()
             if len(flat_i) > len(flat_j):
@@ -292,30 +306,33 @@ def main():
         x2 = loaded_data["x2"]
         labels = loaded_data["labels"][5000:6000]
         # Create dataset
-        dataset = MultimodalDataset(h1[5000:6000], h2[5000:6000], x1[5000:6000], x2[5000:6000], labels)  
+        dataset = MultimodalDataset(h1[5000:6000], h2[5000:6000], x1[5000:6000], x2[5000:6000], labels[5000:6000])  
         # Load model
         # Initialize model
         projection_model = MultiLoReFT(
             input_dims=[10,10], 
-            shared_rank=20, 
+            shared_rank=10, 
             specific_rank=10, 
             pruning_threshold=0.2,
             staging=True,
             pruning=True,
             device=device
-        )
+        ).to(device)
         projection_model = load_checkpoint(filepath="./ckpts/projection_module.pth", model=projection_model)
         projection_model.eval()
         projection_model = projection_model.to(device)
         # Get representations
-        h1 = F.normalize(torch.Tensor(dataset.h1).float(), dim=1).to(device)
-        h2 = F.normalize(torch.Tensor(dataset.h2).float(), dim=1).to(device)
+        h1 = torch.Tensor(h1[5000:6000]).to(device)
+        h2 = torch.Tensor(h2[5000:6000]).to(device)
         phis = projection_model([h1,h2])
+        phi_1 = phis[0]
+        phi_2 = phis[1]
         z = projection_model.fuse_representations(phis)
         z_n = projection_model.decouple(phis, full=True, th=0.05)
-        (z1m, z1s, z2m, z2s) = z_n[0][0], z_n[0][1], z_n[1][0], z_n[1][1]
+        z1m, z1s, z2m, z2s = z_n[0][0], z_n[0][1], z_n[1][0], z_n[1][1]
         prediction_labels = [labels[:,0], labels[:,1], labels[:,2]]
         task_names = ['shared', 'm1', 'm2']
+        modality_names = ["A", "B"]
     
     else:
         # Load CLIP (English only)
@@ -324,17 +341,38 @@ def main():
         if dataset_name=="flickr":
             test_dataset = Multi30KMixedLangDataset(split="test", device=device)
             check_point = "./ckpts/flickr_model_all.pth"
+            projection_model = MultiLoReFT(
+                                        input_dims=[768,768], 
+                                        shared_rank=128, 
+                                        specific_rank=128, 
+                                        device=device
+                                    )
+            modality_names = ["image", "caption"]
         elif dataset_name=="vqa":
             test_dataset = VQADataset(split="validation", device=device)
             check_point = "./ckpts/vqa_model_all.pth"
             test_dataset = torch.utils.data.Subset(test_dataset, range(1000))
+            projection_model = MultiLoReFT(
+                                        input_dims=[768,768], 
+                                        shared_rank=128, 
+                                        specific_rank=128, 
+                                        device=device
+                                    )
+            modality_names = ["image", "question"]
+        elif dataset_name=="cremad":
+            test_dataset = CremadDataset(split='test')
+            check_point = "./ckpts/cremad_model_all.pth"
+            projection_model = MultiLoReFT(input_dims=[400, 768],   # adjust if needed: video_feat dim, audio_feat dim
+                                            shared_rank=512,
+                                            specific_rank=512,
+                                            pruning_threshold=0.1,
+                                            device=device,
+                                            staging=True,
+                                            pruning=True,
+                                            dataset_name="cremad"
+                                        ).to(device)
+            modality_names = ["video", "audio"]
         test_dataloader = DataLoader(test_dataset, batch_size=256, shuffle=False)
-        projection_model = MultiLoReFT(
-                                    input_dims=[768,768], 
-                                    shared_rank=128, 
-                                    specific_rank=128, 
-                                    device=device
-                                )
                                 
         projection_model = load_checkpoint(filepath=check_point, model=projection_model)
         projection_model.eval()
@@ -363,11 +401,24 @@ def main():
                     label = [l1, l2]
                     h1.append(image_feats)
                     h2.append(text_feats)
+                    task_names = ['language', 'other_caption']
+                elif dataset_name=="cremad":
+                    video_feats, audio_feats, x1, x2, subject_id, sentence_id, emotion = batch
+                    sentence_refs = ['IEO', 'TIE', 'IOM', 'IWW', 'TAI', 'MTI', 'IWL', 'ITH', 'DFA', 'ITS', 'TSI', 'WSI']
+                    emotion_refs = ['ANG', 'DIS', 'FEA', 'HAP', 'NEU', 'SAD']
+                    subject_id = torch.Tensor([int(id) for id in subject_id])
+                    sentence_id = torch.Tensor([sentence_refs.index(id) for id in sentence_id])
+                    emotion = torch.Tensor([emotion_refs.index(id) for id in emotion])
+                    h1.append(video_feats)
+                    h2.append(audio_feats)
+                    label = [subject_id, sentence_id, emotion]
+                    task_names = ['subject_id', 'sentence_id', 'emotion']
                 elif dataset_name=="vqa":
                     image_feats, question_feats, x1, x2, answer, answer_feat = batch
                     h1.append(image_feats)
                     h2.append(question_feats)
                     label = [answer_feat]
+                    task_names = ['answer']
                 phis = projection_model([h1[-1].to(device), h2[-1].to(device)])
                 z.append(projection_model.fuse_representations(phis))
                 z_n = projection_model.decouple(phis, full=True)
@@ -401,23 +452,23 @@ def main():
             random_caption = x2_all[random_sample]
             random_image = x1_all[random_sample]
 
-            # Explore the latent space to find the closest samples
-            closest_images_shared = find_closest_samples(z1s, z1s[random_sample], "image shared")
-            closest_images_modality_specific = find_closest_samples(z1m, z1m[random_sample], "image modality-specific")
-            closest_captions_shared = find_closest_samples(z2m, z2m[random_sample], "caption shared")
-            closest_captions_modality_specific = find_closest_samples(z2m, z2m[random_sample], "caption modality-specific")
-            print("Reference caption: ", x2_all[random_sample])
-            print("Closest captions in modality-specific space:")
-            for ind in closest_captions_modality_specific:
-                print(x2_all[ind])
-            print("Closest captions in shared space:")
-            for ind in closest_captions_shared:
-                print(x2_all[ind])
+            if dataset_name=="flickr" or dataset_name=="vqa":
+                # Explore the latent space to find the closest samples
+                closest_images_shared = find_closest_samples(z1s, z1s[random_sample], "image shared")
+                closest_images_modality_specific = find_closest_samples(z1m, z1m[random_sample], "image modality-specific")
+                closest_captions_shared = find_closest_samples(z2s, z2s[random_sample], "caption shared")
+                closest_captions_modality_specific = find_closest_samples(z2m, z2m[random_sample], "caption modality-specific")
+                print("Reference caption: ", x2_all[random_sample])
+                print("Closest captions in modality-specific space:")
+                for ind in closest_captions_modality_specific:
+                    print(x2_all[ind])
+                print("Closest captions in shared space:")
+                for ind in closest_captions_shared:
+                    print(x2_all[ind])
 
-        plot_closest_images(x1_all, x1_all[random_sample], closest_images_modality_specific, './plots/%s/closest_images_modality_specific.png' % dataset_name)
-        plot_closest_images(x1_all, x1_all[random_sample], closest_images_shared, './plots/%s/closest_shared_space.png' % dataset_name)
+                plot_closest_images(x1_all, x1_all[random_sample], closest_images_modality_specific, './plots/%s/closest_images_modality_specific.png' % dataset_name)
+                plot_closest_images(x1_all, x1_all[random_sample], closest_images_shared, './plots/%s/closest_shared_space.png' % dataset_name)
         prediction_labels = labels
-        task_names = ['language', 'other_caption'] if dataset_name=="flickr" else ['answer']
 
     # Evaluate and plot
     plot_projection_matrices(projection_model)
@@ -448,9 +499,13 @@ def main():
         print(name, z.shape)
     for task_ind, label_task in enumerate(prediction_labels):
         print(label_task.shape)
-        label_task = label_task.squeeze()
-        if label_task[0].numel() == 1:
-            plot_representations((z1m, z1s, z2m, z2s), label_task, task_names[task_ind], dataset_name)
+        # Fix: check if label_task[0] is a scalar (numpy.float64) or array
+        if np.isscalar(label_task[0]) or (hasattr(label_task[0], 'shape') and label_task[0].shape == ()):  # scalar
+            # handle scalar case
+            plot_representations((z1m, z1s, z2m, z2s), label_task, task_names[task_ind], dataset_name, modality_names=modality_names)
+        else:
+            # handle array case
+            plot_representations((z1m, z1s, z2m, z2s), label_task, task_names[task_ind], dataset_name, modality_names=modality_names)
         evaluate_predictability(components, label_task, task_names[task_ind], dataset_name)
     
     # Evaluate predictability for each label
