@@ -20,17 +20,21 @@ class MultiLoReFT(nn.Module):
             encoders=None, 
             pruning_threshold=0.05, 
             pruning=True, 
-            r_init="uniform",
+            w_init=None,
+            r_init_gain=0.1,
             device=None, 
             dataset_name="simulated",
             verbose=True,
             wandb_log=False,
             intervene_layer=-1,
+            pruning_value_threshold=0.1,
+            w_depth=2,
         ):
         super(MultiLoReFT, self).__init__()
         self.shared_rank = shared_rank
         self.specific_rank = specific_rank
         self.pruning_threshold = pruning_threshold
+        self.pruning_value_threshold = pruning_value_threshold
         self.pruned = False
         self.dataset_name = dataset_name
         self.encoders = encoders
@@ -62,41 +66,44 @@ class MultiLoReFT(nn.Module):
         self.R_m1 = nn.Parameter(torch.empty(specific_rank, input_dims[0], dtype=torch.float32))
         self.R_m2 = nn.Parameter(torch.empty(specific_rank, input_dims[1], dtype=torch.float32))
         # Initialize weights
-        self._orthogonal_init()
+        self._orthogonal_init(r_init_gain)
         # Create weight networks for each modality
-        self._create_weight_networks(input_dims, r_init)
-    
-    def _create_weight_networks(self, input_dims, r_init):
+        self._create_weight_networks(input_dims, w_init, w_depth)
+
+    def _create_weight_networks(self, input_dims, r_init, w_depth=2):
         """Create weight networks for each modality."""
         # Modality 1 weights
-        self.W_s0 = nn.Sequential(
-            nn.Linear(input_dims[0], input_dims[0] * 2, dtype=torch.float32),
-            nn.ReLU(),
-            nn.Linear(input_dims[0] * 2, self.shared_rank, dtype=torch.float32)
-        )   
-        self.W_m0 = nn.Sequential(
-            nn.Linear(input_dims[0], input_dims[0] * 2, dtype=torch.float32),
-            nn.ReLU(),
-            nn.Linear(input_dims[0] * 2, self.specific_rank, dtype=torch.float32)
-        )
-        
-        # Modality 2 weights
-        self.W_s1 = nn.Sequential(
-            nn.Linear(input_dims[1], input_dims[1] * 2, dtype=torch.float32),
-            nn.ReLU(),
-            nn.Linear(input_dims[1] * 2, self.shared_rank, dtype=torch.float32)
-        )       
-        self.W_m1 = nn.Sequential(
-            nn.Linear(input_dims[1], input_dims[1] * 2, dtype=torch.float32),
-            nn.ReLU(),
-            nn.Linear(input_dims[1] * 2, self.specific_rank, dtype=torch.float32)
-        )
+        hidden_sizes = [input_dims[0] * 2, input_dims[1] * 2]
+        self.W_s0 = nn.ModuleList()
+        self.W_m0 = nn.ModuleList()
+        self.W_s1 = nn.ModuleList()
+        self.W_m1 = nn.ModuleList()
+        for i in range(w_depth):
+            in_dim0, in_dim1 = hidden_sizes[0], hidden_sizes[1]
+            out_dim0, out_dim1 = hidden_sizes[0], hidden_sizes[1]
+            if i == 0:
+                in_dim0, in_dim1 = input_dims[0], input_dims[1]
+            if i == w_depth - 1:
+                self.W_s0.append(nn.Linear(in_dim0, self.shared_rank, dtype=torch.float32))
+                self.W_m0.append(nn.Linear(in_dim0, self.specific_rank, dtype=torch.float32))
+                self.W_s1.append(nn.Linear(in_dim1, self.shared_rank, dtype=torch.float32))
+                self.W_m1.append(nn.Linear(in_dim1, self.specific_rank, dtype=torch.float32))
+            else:
+                self.W_s0.append(nn.Linear(in_dim0, out_dim0, dtype=torch.float32))
+                self.W_m0.append(nn.Linear(in_dim0, out_dim0, dtype=torch.float32))
+                self.W_s1.append(nn.Linear(in_dim1, out_dim1, dtype=torch.float32))
+                self.W_m1.append(nn.Linear(in_dim1, out_dim1, dtype=torch.float32))
+                self.W_s0.append(nn.ReLU())
+                self.W_m0.append(nn.ReLU())
+                self.W_s1.append(nn.ReLU())
+                self.W_m1.append(nn.ReLU())
 
         # custom weight initialization
-        custom_weight_init(self.W_s0, init_option=r_init)
-        custom_weight_init(self.W_m0, init_option=r_init)
-        custom_weight_init(self.W_s1, init_option=r_init)
-        custom_weight_init(self.W_m1, init_option=r_init)
+        if r_init is not None:
+            custom_weight_init(self.W_s0, init_option=r_init)
+            custom_weight_init(self.W_m0, init_option=r_init)
+            custom_weight_init(self.W_s1, init_option=r_init)
+            custom_weight_init(self.W_m1, init_option=r_init)
     
     #def _orthogonal_init(self, r_init):
     #    """Initialize projection matrices with uniform distribution."""
@@ -104,11 +111,11 @@ class MultiLoReFT(nn.Module):
     #    custom_weight_init(self.R_m1, init_option=r_init)
     #    custom_weight_init(self.R_m2, init_option=r_init)
     
-    def _orthogonal_init(self):
-        nn.init.orthogonal_(self.R_s, gain=0.1)
-        nn.init.orthogonal_(self.R_m1, gain=0.1)
-        nn.init.orthogonal_(self.R_m2, gain=0.1)
-    
+    def _orthogonal_init(self, gain=0.1):
+        nn.init.orthogonal_(self.R_s, gain=gain)
+        nn.init.orthogonal_(self.R_m1, gain=gain)
+        nn.init.orthogonal_(self.R_m2, gain=gain)
+
     def get_trainable_parameters(self):
         """Get parameters to train based on current stage."""
         if self.trainable_stage == "shared":
@@ -118,7 +125,7 @@ class MultiLoReFT(nn.Module):
         else:  # joint 
             return list(self.parameters())
     
-    def prune_singular_values(self, single=False):
+    def prune_singular_values(self, single=False, threshold=0.1):
         """Prune singular values below threshold and update network weights."""
         def prune_matrix(name, R, weights_to_prune):
             U, S, V = torch.svd(R)
@@ -143,7 +150,7 @@ class MultiLoReFT(nn.Module):
                 if num_below == 0:
                     return R, len(S)
                 # Calculate number to remove (between 1-10% of matrix size)
-                n_remove = max(1, min(num_below, int(0.1 * len(S))))
+                n_remove = max(1, min(num_below, int(threshold * len(S))))
                 # Get indices of n smallest singular values
                 smallest_n_idx = torch.argsort(S)[:n_remove]
                 keep_indices[:len(S)][smallest_n_idx] = False
@@ -185,18 +192,35 @@ class MultiLoReFT(nn.Module):
     def forward(self, embeddings):
         h1 = F.normalize(embeddings[0], p=2, dim=-1)
         h2 = F.normalize(embeddings[1], p=2, dim=-1)
+
+        h1_preproj_s = h1.clone()
+        h1_preproj_m = h1.clone()
+        h2_preproj_s = h2.clone()
+        h2_preproj_m = h2.clone()
+        for layer in self.W_s0:
+            h1_preproj_s = layer(h1_preproj_s)
+        for layer in self.W_m0:
+            h1_preproj_m = layer(h1_preproj_m)
+        for layer in self.W_s1:
+            h2_preproj_s = layer(h2_preproj_s)
+        for layer in self.W_m1:
+            h2_preproj_m = layer(h2_preproj_m)
         # Shared projections
-        proj_s0 = self.W_s0(h1) - F.linear(h1, self.R_s)             # (B, shared_rank)
+        #proj_s0 = self.W_s0(h1) - F.linear(h1, self.R_s)             # (B, shared_rank)
+        proj_s0 = h1_preproj_s - F.linear(h1, self.R_s)
         shared_h1 = F.linear(proj_s0, self.R_s.T)                    # (B, D)
 
-        proj_s1 = self.W_s1(h2) - F.linear(h2, self.R_s)
+        #proj_s1 = self.W_s1(h2) - F.linear(h2, self.R_s)
+        proj_s1 = h2_preproj_s - F.linear(h2, self.R_s)
         shared_h2 = F.linear(proj_s1, self.R_s.T)
 
         # Modality-specific projections
-        proj_m0 = self.W_m0(h1) - F.linear(h1, self.R_m1)
+        #proj_m0 = self.W_m0(h1) - F.linear(h1, self.R_m1)
+        proj_m0 = h1_preproj_m - F.linear(h1, self.R_m1)
         spec_h1 = F.linear(proj_m0, self.R_m1.T)
 
-        proj_m1 = self.W_m1(h2) - F.linear(h2, self.R_m2)
+        #proj_m1 = self.W_m1(h2) - F.linear(h2, self.R_m2)
+        proj_m1 = h2_preproj_m - F.linear(h2, self.R_m2)
         spec_h2 = F.linear(proj_m1, self.R_m2.T)
 
         # Final representations
@@ -339,11 +363,11 @@ class MultiLoReFT(nn.Module):
             print(f"Training on device: {self.device}")
             print(f"Model is on device: {next(self.parameters()).device}")
         # Initialize loss tracking
-        loss_balancer = GradientNormalizedLoss(num_losses=3)
+        loss_balancer = GradientNormalizedLoss(num_losses=2)
         all_epoch_losses = []
         all_epoch_stages = []
         trainable_params = self.get_trainable_parameters()
-        optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-3)
+        optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=hyperparameters.get('weight_decay', 1e-4))
         scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
         
         # Training loop
@@ -425,7 +449,7 @@ class MultiLoReFT(nn.Module):
             if self.pruning:
                 # Prune if in joint stage
                 if self.trainable_stage == "joint" and val_loss_list[-1] <= self.stage_tracking['best_val_MI_loss']*1.05 and epoch>self.stage_switches[-1][-1]+10 and epoch > warmup:
-                    self.prune_singular_values()
+                    self.prune_singular_values(single=hyperparameters.get("single_prune", False), threshold=self.pruning_value_threshold)
                     optimizer = self.update_optimizer(optimizer)
                     scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
             
@@ -472,15 +496,15 @@ class MultiLoReFT(nn.Module):
                     self.stage_tracking["best_val_loss"] = 5000
                     self.stage_tracking["plateau_counter"] = 0
                     self.stage_tracking["min_epochs_counter"] = 0
-                elif self.trainable_stage == "joint" and should_switch:
-                    if self.verbose:
-                        print(f"***** [Epoch {epoch}] → Early stopping after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
-                    break
+                #elif self.trainable_stage == "joint" and should_switch:
+                #    if self.verbose:
+                #        print(f"***** [Epoch {epoch}] → Early stopping after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
+                #    break
                 
                 # # Update optimizer
                 # trainable_params = model.get_trainable_parameters()
                 # optimizer = torch.optim.Adam(trainable_params, lr=1e-4, weight_decay=1e-4)
-            else: # ealy stopping!
+            else: # early stopping!
                 # Update stage tracking
                 stage_config = early_stopping_config[self.trainable_stage]
                 self.stage_tracking["min_epochs_counter"] += 1
@@ -501,10 +525,10 @@ class MultiLoReFT(nn.Module):
                     self.stage_tracking["min_epochs_counter"] >= stage_config["max_epochs"]
                 )
 
-                if should_switch:
-                    if self.verbose:
-                        print(f"***** [Epoch {epoch}] → Early stopping after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
-                    break
+                #if should_switch:
+                #    if self.verbose:
+                #        print(f"***** [Epoch {epoch}] → Early stopping after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
+                #    break
             
             if self.verbose:
                 # Print progress
@@ -527,6 +551,22 @@ class MultiLoReFT(nn.Module):
         self.save_checkpoint(optimizer, epoch, loss, filepath=save_path)
 
         if self.wandb_log:
+            val_loss, val_logs, val_log_names = evaluate_validation_loss(self, val_dataloader, self.device, final=True)
+            corr_rank_dict = calc_corrs_and_ranks(self)
+            log_dict = {
+                "epoch": epoch+1,
+                "stage": [0 if self.trainable_stage == "shared" else 1 if self.trainable_stage == "private" else 2][0],
+                "lr": optimizer.param_groups[0]['lr'],
+                "relative_improvement": (self.stage_tracking["best_val_loss"] - val_loss) / self.stage_tracking["best_val_loss"]
+            }
+            for i, val_log_name in enumerate(val_log_names):
+                log_dict[val_log_name] = val_logs[i]
+            for key, value in corr_rank_dict.items():
+                log_dict[key] = value
+            if epoch > 0:
+                for i, loss_name in enumerate(all_loss_names):
+                    log_dict[loss_name] = all_epoch_losses[-1][i]
+            log_wandb(log_dict)
             return all_epoch_losses, all_loss_names, all_epoch_stages
 
 
