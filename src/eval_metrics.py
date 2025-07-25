@@ -33,8 +33,11 @@ def evaluate_cross_modal_retrieval(h0, h1, device, batch_size=512, similarity_mo
             if batch_query.size(1) < gallery_set.size(1):
                 padding = torch.zeros(batch_query.size(0), gallery_set.size(1) - batch_query.size(1), device=batch_query.device)
                 batch_query = torch.cat((batch_query, padding), dim=1)
-            projected_query = similarity_model(batch_query)
-            sim_matrix = torch.nn.functional.cosine_similarity(projected_query.unsqueeze(1), gallery_set, dim=2)
+            elif batch_query.size(1) > gallery_set.size(1):
+                padding = torch.zeros(gallery_set.size(0), batch_query.size(1) - gallery_set.size(1), device=gallery_set.device)
+                gallery_set = torch.cat((gallery_set, padding), dim=1)
+            #projected_query = similarity_model(batch_query)
+            sim_matrix = torch.nn.functional.cosine_similarity(batch_query.unsqueeze(1), gallery_set, dim=2)
             topk = sim_matrix.topk(k, dim=1).indices
             true_matches = torch.arange(start, end, device=device).unsqueeze(1)
             correct = (topk == true_matches).any(dim=1).float()
@@ -112,12 +115,14 @@ def compute_classification(z_np, y_np):
             )
     return cv_results['test_accuracy'].mean()
 
-def evaluate_validation_loss(model, val_dataloader, device, verbose=False):
+def evaluate_validation_loss(model, val_dataloader, device, verbose=False, final=False):
     """Evaluate model on validation set."""
     model.eval()
     val_total_loss = 0
     
     # collect all the model outputs
+    h1_ins = []
+    h2_ins = []
     h1_outs = []
     h2_outs = []
     all_labels = []
@@ -132,6 +137,8 @@ def evaluate_validation_loss(model, val_dataloader, device, verbose=False):
 
             phis = model([h1, h2])
 
+            h1_ins.append(h1.clone().detach().cpu())
+            h2_ins.append(h2.clone().detach().cpu())
             h1_outs.append(phis[0].clone().detach().cpu())
             h2_outs.append(phis[1].clone().detach().cpu())
 
@@ -142,6 +149,9 @@ def evaluate_validation_loss(model, val_dataloader, device, verbose=False):
     # concatenate all the outputs
     all_labels = np.concatenate(all_labels, axis=0)
     all_accuracies = []
+    del h1, h2
+    h1 = torch.cat(h1_ins, dim=0).to(device)
+    h2 = torch.cat(h2_ins, dim=0).to(device)
     h1_outs = torch.cat(h1_outs, dim=0).to(device)
     h2_outs = torch.cat(h2_outs, dim=0).to(device)
     all_accuracies.append(compute_classification(h1_outs, all_labels[:,0]))
@@ -151,19 +161,42 @@ def evaluate_validation_loss(model, val_dataloader, device, verbose=False):
     all_accuracies.append(compute_classification(z_n[1][0], all_labels[:,0]))
     all_accuracies.append(compute_classification(z_n[0][1], all_labels[:,0]))
     all_accuracies.append(compute_classification(z_n[1][1], all_labels[:,0]))
+    acc_labels = ['Acc h1_out', 'Acc h2_out', 'Acc Zm1', 'Acc Zm2', 'Acc Zs1', 'Acc Zs2']
 
-    phi1h2, phi2h1 = evaluate_cross_modal_retrieval(h1_outs, h2_outs, projector=model, device=device, labels=all_labels)
+    #phi1h2, phi2h1 = evaluate_cross_modal_retrieval(h1_outs, h2_outs, projector=model, device=device, labels=all_labels)
+    if final:
+        all_recalls = []
+        batch_size = min(256, h1.shape[0], h2.shape[0])
+        z1 = torch.cat((z_n[0][0], z_n[0][1]), dim=1)
+        z2 = torch.cat((z_n[1][0], z_n[1][1]), dim=1)
+        #assert h1.shape[0] == h2.shape[0], f"h1 and h2 must have the same number of samples but have {h1.shape[0]} and {h2.shape[0]}"
+        #assert h1_outs.shape[0] == h2_outs.shape[0], f"h1_outs and h2_outs must have the same number of samples but have {h1_outs.shape[0]} and {h2_outs.shape[0]}"
+        #assert z1.shape[0] == h1.shape[0], f"z1 and h1 must have the same number of samples but have {z1.shape[0]} and {h1.shape[0]}"
+        all_recalls.append(evaluate_cross_modal_retrieval(z1, h2, device=device, batch_size=batch_size, similarity_model=SimilarityMLP(z1.shape[1], h2.shape[1])))
+        all_recalls.append(evaluate_cross_modal_retrieval(z2, h1, device=device, batch_size=batch_size, similarity_model=SimilarityMLP(z2.shape[1], h1.shape[1])))
+        all_recalls.append(evaluate_cross_modal_retrieval(h1_outs, h2, device=device, batch_size=batch_size, similarity_model=SimilarityMLP(h1_outs.shape[1], h2.shape[1])))
+        all_recalls.append(evaluate_cross_modal_retrieval(h2_outs, h1, device=device, batch_size=batch_size, similarity_model=SimilarityMLP(h2_outs.shape[1], h1.shape[1])))
+        all_recalls.append(evaluate_cross_modal_retrieval(h1, h2, device=device, batch_size=batch_size, similarity_model=SimilarityMLP(h1.shape[1], h2.shape[1])))
+        all_recalls.append(evaluate_cross_modal_retrieval(h2, h1, device=device, batch_size=batch_size, similarity_model=SimilarityMLP(h2.shape[1], h1.shape[1])))
+        recall_labels = ['Recall Z1-Z2', 'Recall Z2-Z1', 'Recall phi1-h2', 'Recall phi2-h1', 'Recall h1-h2', 'Recall h2-h1']
 
-    predictabilities = []
-    predictability_labels = []
-    temp_preditability_labels = ['pred-zs1', 'pred-zs2', 'pred-zm1', 'pred-zm2']
-    for label_idx in range(all_labels.shape[1]):
-        temp_predictability = evaluate_predictability((z_n[0][0], z_n[0][1], z_n[1][0], z_n[1][1]), all_labels, label_idx)
-        predictabilities.extend(temp_predictability)
-        predictability_labels.extend([f'{temp_preditability_labels[i]}-{label_idx}' for i in range(len(temp_predictability))])
+        predictabilities = []
+        predictability_labels = []
+        #temp_predictability_labels = ['pred-zs1', 'pred-zs2', 'pred-zm1', 'pred-zm2']
+        #for label_idx in range(all_labels.shape[1]):
+        #    temp_predictability = evaluate_predictability((z_n[0][0], z_n[0][1], z_n[1][0], z_n[1][1]), all_labels, label_idx)
+        #    predictabilities.extend(temp_predictability)
+        #    predictability_labels.extend([f'{temp_predictability_labels[i]}-{label_idx}' for i in range(len(temp_predictability))])
+        regression_df = evaluate_regression(z_n, h1, h2)
+        for i in range(len(regression_df)):
+            predictabilities.append(regression_df.iloc[i]['r2_mean'])
+            predictability_labels.append('Pred ' + regression_df.iloc[i]['name'])
 
-    model.train()
-    return val_total_loss / len(val_dataloader), all_accuracies + [phi1h2, phi2h1] + predictabilities, ['Acc h1_out', 'Acc h2_out', 'Acc Zm1', 'Acc Zm2', 'Acc Zs1', 'Acc Zs2', 'cross-modal AB', 'cross-modal BA'] + predictability_labels
+        model.train()
+        return val_total_loss / len(val_dataloader), all_accuracies + predictabilities + all_recalls, acc_labels + predictability_labels + recall_labels
+    else:
+        model.train()
+        return val_total_loss / len(val_dataloader), all_accuracies, acc_labels
 
 ###
 from torch.utils.data import Dataset, DataLoader
@@ -380,6 +413,7 @@ def reeval_model(model, test_h1, test_h2, test_labels, device, threshold=0.05):
 
 ###
 
+'''
 def evaluate_cross_modal_retrieval(phis0, phis1, projector, device, labels):
     """
     Evaluates cross-modal retrieval performance using cosine similarity.
@@ -414,6 +448,7 @@ def evaluate_cross_modal_retrieval(phis0, phis1, projector, device, labels):
     ba = recall_at_k(sim_matrix.T, k, labels[:,1])
 
     return ab, ba
+'''
 
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
