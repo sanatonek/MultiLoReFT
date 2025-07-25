@@ -452,7 +452,7 @@ class MultiLoReFT(nn.Module):
             if self.pruning:
                 # Prune if in joint stage
                 #if self.trainable_stage == "joint" and val_loss_list[-1] <= self.stage_tracking['best_val_MI_loss']*1.05 and epoch>self.stage_switches[-1][-1]+10 and epoch > warmup:
-                if self.trainable_stage == "joint" and (val_loss_list[-1][-1] <= 1.05*self.stage_tracking['best_val_MI_loss']) and epoch>self.stage_switches[-1][-1]+warmup:
+                if self.trainable_stage == "joint" and (val_loss_list[-1] <= 1.05*self.stage_tracking['best_val_MI_loss']) and epoch>self.stage_switches[-1][-1]+warmup:
                     self.prune_singular_values(single=hyperparameters.get("single_prune", False), threshold=self.pruning_value_threshold)
                     optimizer = self.update_optimizer(optimizer)
                     scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
@@ -471,8 +471,8 @@ class MultiLoReFT(nn.Module):
                 #    self.stage_tracking["best_val_MI_loss"] = val_loss_list[-1]
                 if np.mean(val_loss)<self.stage_tracking["best_val_loss"]:
                     self.stage_tracking["best_val_loss"] = np.mean(val_loss)
-                if val_loss_list[-1][-1] <self.stage_tracking["best_val_MI_loss"]:
-                    self.stage_tracking["best_val_MI_loss"] = val_loss_list[-1][-1]
+                if val_loss_list[-1] <self.stage_tracking["best_val_MI_loss"]:
+                    self.stage_tracking["best_val_MI_loss"] = val_loss_list[-1]
                 
                 # Update tracking metrics
                 if relative_improvement > stage_config["min_improvement_ratio"]:
