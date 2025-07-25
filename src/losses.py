@@ -33,7 +33,7 @@ class GradientNormalizedLoss:
         self.running_losses = torch.zeros(num_losses)
         self.running_count = 0
     
-    def __call__(self, losses, trainable_params):
+    def __call__(self, losses, trainable_params=None, weights=None):
         """
         Compute gradient-normalized loss weights.
         
@@ -49,30 +49,57 @@ class GradientNormalizedLoss:
         losses = torch.stack([l if isinstance(l, torch.Tensor) else torch.tensor(l) for l in losses])
         
         # Compute gradients for each loss
-        grads = []
-        for loss in losses:
+        #grads = []
+        #for loss in losses:
         #     model.zero_grad()
-            loss.backward(retain_graph=True)
+        #    loss.backward(retain_graph=True)
             
             # Collect gradients for trainable parameters
-            param_grads = []
-            for p in trainable_params:
-                if p.grad is not None:
-                    param_grads.append(p.grad.view(-1))
+        #    param_grads = []
+        #    for p in trainable_params:
+        #        if p.grad is not None:
+        #            param_grads.append(p.grad.view(-1))
             
-            if param_grads:
-                grad = torch.cat(param_grads)
-                grads.append(grad)
-            else:
-                grads.append(torch.zeros_like(trainable_params[0].view(-1)))
+        #    if param_grads:
+        #        grad = torch.cat(param_grads)
+        #        grads.append(grad)
+        #    else:
+        #        grads.append(torch.zeros_like(trainable_params[0].view(-1)))
         
         # Normalize gradients and compute weights
-        grad_norms = [torch.norm(g) for g in grads]
-        weights = [1.0 / (norm + 1e-8) for norm in grad_norms]
+        #grad_norms = [torch.norm(g) for g in grads]
+        #weights = [1.0 / (norm + 1e-8) for norm in grad_norms]
 
         # Normalize weights so they sum to 1
-        weights = torch.tensor(weights)
-        weights = weights / weights.sum()
+        #weights = torch.tensor(weights)
+        #weights = weights / weights.sum()
+
+        if weights is None:
+            # Compute gradients for each loss
+            grads = []
+            for loss in losses:
+            #     model.zero_grad()
+                loss.backward(retain_graph=True)
+                
+                # Collect gradients for trainable parameters
+                param_grads = []
+                for p in trainable_params:
+                    if p.grad is not None:
+                        param_grads.append(p.grad.view(-1))
+                
+                if param_grads:
+                    grad = torch.cat(param_grads)
+                    grads.append(grad)
+                else:
+                    grads.append(torch.zeros_like(trainable_params[0].view(-1)))
+        
+            # Normalize gradients and compute weights
+            grad_norms = [torch.norm(g) for g in grads]
+            weights = [1.0 / (norm + 1e-8) for norm in grad_norms]
+
+            # Normalize weights so they sum to 1
+            weights = torch.tensor(weights)
+            weights = weights / weights.sum()
 
         weighted_loss = sum(w * l for w, l in zip(weights, losses))
         
@@ -214,12 +241,12 @@ def loss_orthogonality(R_s, R_m1, R_m2):
     # loss_ortho_2 = torch.norm(torch.mm(R_m1, R_m2.T), p="fro")**2/ R_m1.numel()
     # loss_ortho_3 = torch.norm(torch.mm(R_s, R_m2.T), p="fro")**2/ R_s.numel()
     # return loss_ortho_1 + loss_ortho_2 + loss_ortho_3
-    def safe_normalize(x):
-        return x / (x.norm(dim=-1, keepdim=True) + 1e-8)
+    #def safe_normalize(x):
+    #    return x / (x.norm(dim=-1, keepdim=True) + 1e-8)
 
-    R_s = safe_normalize(R_s)
-    R_m1 = safe_normalize(R_m1)
-    R_m2 = safe_normalize(R_m2)
+    #R_s = safe_normalize(R_s)
+    #R_m1 = safe_normalize(R_m1)
+    #R_m2 = safe_normalize(R_m2)
 
     # Use mean of squared cosine similarities instead of Frobenius norm directly
     def ortho_pair(A, B):
@@ -230,7 +257,7 @@ def loss_orthogonality(R_s, R_m1, R_m2):
     loss_ortho_2 = ortho_pair(R_m1, R_m2)
     loss_ortho_3 = ortho_pair(R_s, R_m2)
 
-    return (loss_ortho_1 + loss_ortho_2 + loss_ortho_3)
+    return (loss_ortho_1 + loss_ortho_2 + loss_ortho_3) # Sana changed loss 2 to three, but I am not sure if that is correct cause then there is loss 3 twice
 
 def loss_shared_consistency(z_s1, z_s2):
     """
@@ -277,6 +304,19 @@ def _rbf_kernel(x: torch.Tensor, sigma: float = None, eps: float = 1e-8) -> torc
 
     gamma = 1.0 / (2 * sigma ** 2 + eps)
     K = torch.exp(-gamma * dist_sq)
+    return K
+
+def rbf_kernel(x, sigma=None):
+    n = x.size(0)
+    x_norm = (x ** 2).sum(dim=1, keepdim=True)
+    dist_sq = x_norm + x_norm.t() - 2 * torch.mm(x, x.t())
+    if sigma is None:
+        dists = dist_sq.detach().clone()
+        dists = dists[~torch.eye(n, dtype=torch.bool, device=x.device)]
+        median_val = torch.median(dists)
+        # median_val = torch.clamp(median_val, min=1e-6)
+        sigma = torch.sqrt(0.5 * median_val)
+    K = torch.exp(-dist_sq / (2 * (sigma ** 2)))
     return K
 
 def hsic_rbf(x: torch.Tensor, y: torch.Tensor, sigma_x: float = None, sigma_y: float = None, unbiased: bool = True) -> torch.Tensor:
@@ -337,7 +377,8 @@ def loss_independence(z_s1, z_s2, z_m1, z_m2):
     """
     Compute independence loss between shared and modality-specific representations.
     """
-    return hsic_rbf(z_s1, z_m1) + hsic_rbf(z_s2, z_m2)+ hsic_rbf(z_m1, z_m2)
+    #return hsic_rbf(z_s1, z_m1) + hsic_rbf(z_s2, z_m2)+ hsic_rbf(z_m1, z_m2)
+    return hsic_rbf(z_s1, z_m1, unbiased=False) + hsic_rbf(z_s2, z_m2, unbiased=False)+ hsic_rbf(z_m1, z_m2, unbiased=False)
 
 
 def center_gram(gram):

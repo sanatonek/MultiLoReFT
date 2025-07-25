@@ -292,9 +292,9 @@ class MultiLoReFT(nn.Module):
     def evaluate_validation_loss(self, val_dataloader, **kwargs):
         """Evaluate model on validation set."""
         val_total_loss = 0
-        #val_loss_list = [0]*3
-        val_loss_list = None
-        loss_balancer = GradientNormalizedLoss(num_losses=3)
+        val_loss_list = [0]*2
+        #val_loss_list = None
+        loss_balancer = GradientNormalizedLoss(num_losses=2)
         self.eval()
         with torch.no_grad():
             for val_batch in val_dataloader:
@@ -334,7 +334,10 @@ class MultiLoReFT(nn.Module):
                 val_total_loss += val_loss.item()
                 if val_loss_list is None:
                     val_loss_list = np.zeros(len(all_losses_list))
-                val_loss_list += np.array(all_losses_list)
+                    val_loss_list += np.array(all_losses_list)
+                else:
+                    val_loss_list[0] += all_losses_list[0]
+                    val_loss_list[1] += all_losses_list[1]
         self.train() 
         val_loss_list = [loss / len(val_dataloader) for loss in val_loss_list]
         return val_total_loss / len(val_dataloader), val_loss_list
@@ -448,7 +451,8 @@ class MultiLoReFT(nn.Module):
             val_loss, val_loss_list = self.evaluate_validation_loss(val_dataloader, **kwargs)
             if self.pruning:
                 # Prune if in joint stage
-                if self.trainable_stage == "joint" and val_loss_list[-1] <= self.stage_tracking['best_val_MI_loss']*1.05 and epoch>self.stage_switches[-1][-1]+10 and epoch > warmup:
+                #if self.trainable_stage == "joint" and val_loss_list[-1] <= self.stage_tracking['best_val_MI_loss']*1.05 and epoch>self.stage_switches[-1][-1]+10 and epoch > warmup:
+                if self.trainable_stage == "joint" and (val_loss_list[-1][-1] <= 1.05*self.stage_tracking['best_val_MI_loss']) and epoch>self.stage_switches[-1][-1]+warmup:
                     self.prune_singular_values(single=hyperparameters.get("single_prune", False), threshold=self.pruning_value_threshold)
                     optimizer = self.update_optimizer(optimizer)
                     scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
@@ -458,12 +462,17 @@ class MultiLoReFT(nn.Module):
                 self.stage_tracking["min_epochs_counter"] += 1
                 
                 # Calculate improvement
-                relative_improvement = (self.stage_tracking["best_val_loss"] - val_loss) / self.stage_tracking["best_val_loss"]
+                #relative_improvement = (self.stage_tracking["best_val_loss"] - val_loss) / self.stage_tracking["best_val_loss"]
+                relative_improvement = (self.stage_tracking["best_val_loss"] - np.mean(val_loss)) / self.stage_tracking["best_val_loss"]
                 
-                if val_loss<self.stage_tracking["best_val_loss"]:
-                    self.stage_tracking["best_val_loss"] = val_loss
-                if val_loss_list[-1] < self.stage_tracking["best_val_MI_loss"]:
-                    self.stage_tracking["best_val_MI_loss"] = val_loss_list[-1]
+                #if val_loss<self.stage_tracking["best_val_loss"]:
+                #    self.stage_tracking["best_val_loss"] = val_loss
+                #if val_loss_list[-1] < self.stage_tracking["best_val_MI_loss"]:
+                #    self.stage_tracking["best_val_MI_loss"] = val_loss_list[-1]
+                if np.mean(val_loss)<self.stage_tracking["best_val_loss"]:
+                    self.stage_tracking["best_val_loss"] = np.mean(val_loss)
+                if val_loss_list[-1][-1] <self.stage_tracking["best_val_MI_loss"]:
+                    self.stage_tracking["best_val_MI_loss"] = val_loss_list[-1][-1]
                 
                 # Update tracking metrics
                 if relative_improvement > stage_config["min_improvement_ratio"]:
@@ -477,7 +486,8 @@ class MultiLoReFT(nn.Module):
                     self.stage_tracking["min_epochs_counter"] >= stage_config["max_epochs"]
                 )
                 
-                if self.trainable_stage != "joint" and self.staging and should_switch:
+                #if self.trainable_stage != "joint" and self.staging and should_switch:
+                if self.staging and should_switch:
                     print(f"Final {self.trainable_stage} stage loss: {val_loss:.4f}")
                     if self.trainable_stage == "shared":
                         self.trainable_stage = "private"
@@ -489,6 +499,11 @@ class MultiLoReFT(nn.Module):
                         self.stage_tracking["best_val_MI_loss"] = 5000
                         self.stage_switches.append(('joint', epoch))
                         print(f"***** [Epoch {epoch}] → Switched to JOINT stage after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
+                    elif self.trainable_stage == "joint":
+                        if self.verbose:
+                            print(f"Final {self.trainable_stage} stage loss: {val_loss:.4f}")
+                            print("Training complete.")
+                        break
                     # trainable_params = self.get_trainable_parameters()
                     # optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-4)
                     optimizer = self.update_optimizer(optimizer)
