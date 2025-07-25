@@ -155,7 +155,7 @@ def generate_simplest_multimodal_data(n_samples, save_path='./data/', version='v
     print(f"Dataset saved to {data_name}")
     return torch.tensor(h1, dtype=torch.float32), torch.tensor(h2, dtype=torch.float32), torch.tensor(X_1, dtype=torch.float32), torch.tensor(X_2, dtype=torch.float32), labels
 
-def generate_simplest_multimodal_data_nongaussian(n_samples, save_path='./data/', seed=4):
+def generate_simplest_multimodal_data_nongaussian(n_samples, save_path='./data/', seed=5):
     """
     Generates a synthetic dataset with two modalities using non-Gaussian distributions.
     
@@ -176,7 +176,7 @@ def generate_simplest_multimodal_data_nongaussian(n_samples, save_path='./data/'
 
     # Define dimensions
     n_hidden_shared = 2
-    n_hidden_specific = [2, 3]
+    n_hidden_specific = [2, 2]
     n_out_features = [10, 10]  # Match original output dimensions
     
     # Helper function for sampling from different distributions
@@ -186,13 +186,13 @@ def generate_simplest_multimodal_data_nongaussian(n_samples, save_path='./data/'
         elif distrib == 'poisson':
             return np.random.poisson(1, size=(n_samples, n_hidden)) + 1
         elif distrib == 'beta':
-            return np.random.beta(3, 2, size=(n_samples, n_hidden)) * 1
+            return np.random.beta(3, 2, size=(n_samples, n_hidden))
         elif distrib == 'uniform':
             return np.random.uniform(0, 1, size=(n_samples, n_hidden))
         elif distrib == 'gumbel':
             return np.random.gumbel(0, 1, size=(n_samples, n_hidden))
         elif distrib == 'weibull':
-            return np.random.weibull(1.5, size=(n_samples, n_hidden))
+            return np.random.weibull(1.5, size=(n_samples, n_hidden)) * 0.3
         else:
             raise ValueError(f"Unknown distribution: {distrib}")
     
