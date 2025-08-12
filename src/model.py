@@ -359,7 +359,7 @@ class MultiLoReFT(nn.Module):
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
         return scheduler
 
-    def train_projection(self, dataloader, val_dataloader, early_stopping_config, hyperparameters=None, lr=1e-3, epochs=100, exp_name="projection_module", warmup=100, **kwargs):#save_path="./ckpts/projection_module.pth"):
+    def train_projection(self, dataloader, val_dataloader, early_stopping_config, hyperparameters=None, lr=1e-3, epochs=100, exp_name="projection_module", warmup=30, **kwargs):#save_path="./ckpts/projection_module.pth"):
         """Train the projection model with early stopping."""
         save_path='./ckpts/%s.pth'%(exp_name)
         if self.verbose:
@@ -374,6 +374,8 @@ class MultiLoReFT(nn.Module):
         scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
         
         # Training loop
+        shared_mse_loss = 0
+        mean_zs = [0,0,0,0]
         for epoch in range(epochs):
             total_loss = 0
             #epoch_losses = np.zeros(3)
@@ -381,12 +383,20 @@ class MultiLoReFT(nn.Module):
 
             if self.wandb_log:
                 val_loss, val_logs, val_log_names = evaluate_validation_loss(self, val_dataloader, self.device)
-                corr_rank_dict = calc_corrs_and_ranks(self)
+                corr_rank_dict = calc_corrs_and_ranks(self, threshold=self.pruning_threshold)
                 log_dict = {
                     "epoch": epoch,
                     "stage": [0 if self.trainable_stage == "shared" else 1 if self.trainable_stage == "private" else 2][0],
                     "lr": optimizer.param_groups[0]['lr'],
-                    "relative_improvement": (self.stage_tracking["best_val_loss"] - val_loss) / self.stage_tracking["best_val_loss"]
+                    "relative_improvement": (self.stage_tracking["best_val_loss"] - val_loss) / self.stage_tracking["best_val_loss"],
+                    "shared_MSE": shared_mse_loss,
+                    "mean_Zs1": mean_zs[0],
+                    "mean_Zs2": mean_zs[1],
+                    "mean_Zm1": mean_zs[2],
+                    "mean_Zm2": mean_zs[3],
+                    "dim R_s": self.R_s.shape[0],
+                    "dim R_m1": self.R_m1.shape[0],
+                    "dim R_m2": self.R_m2.shape[0],
                 }
                 for i, val_log_name in enumerate(val_log_names):
                     log_dict[val_log_name] = val_logs[i]
@@ -396,6 +406,8 @@ class MultiLoReFT(nn.Module):
                     for i, loss_name in enumerate(all_loss_names):
                         log_dict[loss_name] = all_epoch_losses[-1][i]
                 log_wandb(log_dict)
+            shared_mse_loss = 0
+            mean_zs = [0,0,0,0]
             
             # Training step
             for batch in (dataloader):
@@ -426,33 +438,46 @@ class MultiLoReFT(nn.Module):
                 #h2 = F.normalize(h2.float(), dim=1).to(self.device)
                 h1 = h1.to(self.device)
                 h2 = h2.to(self.device)
-                #phis = self.forward([h1, h2])
+                phis = self.forward([h1, h2])
                 
-                #z_components = self.decouple(phis, full=True)
-                z_components = self.decouple([h1, h2], full=True)
+                z_components = self.decouple(phis, full=True)
+                #z_components = self.decouple([h1, h2], full=True)
                 losses_list, loss_names, all_losses, all_loss_names = self.compute_stage_losses(h1, h2, z_components)
                 
                 losses = torch.stack(losses_list)
                 
                 optimizer.zero_grad()
                 loss, weights = loss_balancer(losses, trainable_params)
+                # add shared alignment loss
+                shared_mse_loss_batch = F.mse_loss(z_components[0][1], z_components[1][1])
+                #loss += shared_mse_loss_batch
                 loss.backward()
                 optimizer.step()
                 
                 total_loss += loss.item()
+                shared_mse_loss += shared_mse_loss_batch.item()
                 epoch_losses += all_losses
+
+                # observe mean Z values to check collapse
+                mean_zs[0] += torch.mean(z_components[0][1]).item()
+                mean_zs[1] += torch.mean(z_components[1][1]).item()
+                mean_zs[2] += torch.mean(z_components[0][0]).item()
+                mean_zs[3] += torch.mean(z_components[1][0]).item()
             
             # Update metrics
             epoch_losses = epoch_losses / len(dataloader)
+            shared_mse_loss = shared_mse_loss / len(dataloader)
             all_epoch_losses.append(epoch_losses)
             all_epoch_stages.append(self.trainable_stage)
             scheduler.step()
+
+            mean_zs = [mean / len(dataloader) for mean in mean_zs]
             
             val_loss, val_loss_list = self.evaluate_validation_loss(val_dataloader, **kwargs)
             if self.pruning:
                 # Prune if in joint stage
                 #if self.trainable_stage == "joint" and val_loss_list[-1] <= self.stage_tracking['best_val_MI_loss']*1.05 and epoch>self.stage_switches[-1][-1]+10 and epoch > warmup:
-                if self.trainable_stage == "joint" and (val_loss_list[-1] <= 1.05*self.stage_tracking['best_val_MI_loss']) and epoch>self.stage_switches[-1][-1]+warmup:
+                if self.trainable_stage == "joint" and (val_loss_list[-1] <= (1.0+self.pruning_threshold)*self.stage_tracking['best_val_MI_loss']) and epoch>self.stage_switches[-1][-1]+warmup:
                     self.prune_singular_values(single=hyperparameters.get("single_prune", False), threshold=self.pruning_value_threshold)
                     optimizer = self.update_optimizer(optimizer)
                     scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
@@ -488,24 +513,31 @@ class MultiLoReFT(nn.Module):
                 
                 #if self.trainable_stage != "joint" and self.staging and should_switch:
                 if self.staging and should_switch:
-                    print(f"Final {self.trainable_stage} stage loss: {val_loss:.4f}")
+                    #print(f"Final {self.trainable_stage} stage loss: {val_loss:.4f}")
                     if self.trainable_stage == "shared":
+                        print(f"Final {self.trainable_stage} stage loss: {val_loss:.4f}")
                         self.trainable_stage = "private"
                         self.stage_switches = getattr(self, "stage_switches", [])
                         self.stage_switches.append(('private', epoch))
                         print(f"***** [Epoch {epoch}] → Switched to PRIVATE stage after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
                     elif self.trainable_stage == "private":
+                        print(f"Final {self.trainable_stage} stage loss: {val_loss:.4f}")
                         self.trainable_stage = "joint"
                         self.stage_tracking["best_val_MI_loss"] = 5000
                         self.stage_switches.append(('joint', epoch))
                         print(f"***** [Epoch {epoch}] → Switched to JOINT stage after {self.stage_tracking['min_epochs_counter']} epochs ***** ")
                     elif self.trainable_stage == "joint":
-                        if self.verbose:
-                            print(f"Final {self.trainable_stage} stage loss: {val_loss:.4f}")
-                            print("Training complete.")
-                        break
+                        if hyperparameters['early_stopping']:
+                            if self.verbose:
+                                print(f"Final {self.trainable_stage} stage loss: {val_loss:.4f}")
+                                print("Training complete.")
+                            break
                     # trainable_params = self.get_trainable_parameters()
                     # optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-4)
+                    # if in joint stage, reduce the learning rate
+                    if self.trainable_stage == "joint":
+                        for param_group in optimizer.param_groups:
+                            param_group['lr'] = lr * 0.1
                     optimizer = self.update_optimizer(optimizer)
                     scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
                     self.stage_tracking["best_val_loss"] = 5000
@@ -572,7 +604,15 @@ class MultiLoReFT(nn.Module):
                 "epoch": epoch+1,
                 "stage": [0 if self.trainable_stage == "shared" else 1 if self.trainable_stage == "private" else 2][0],
                 "lr": optimizer.param_groups[0]['lr'],
-                "relative_improvement": (self.stage_tracking["best_val_loss"] - val_loss) / self.stage_tracking["best_val_loss"]
+                "relative_improvement": (self.stage_tracking["best_val_loss"] - val_loss) / self.stage_tracking["best_val_loss"],
+                "shared_MSE": shared_mse_loss,
+                "mean_Zs1": mean_zs[0],
+                "mean_Zs2": mean_zs[1],
+                "mean_Zm1": mean_zs[2],
+                "mean_Zm2": mean_zs[3],
+                "dim R_s": self.R_s.shape[0],
+                "dim R_m1": self.R_m1.shape[0],
+                "dim R_m2": self.R_m2.shape[0],
             }
             for i, val_log_name in enumerate(val_log_names):
                 log_dict[val_log_name] = val_logs[i]
