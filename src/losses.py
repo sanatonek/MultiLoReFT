@@ -109,6 +109,7 @@ def loss_reconstruction(h, x, decoder):
     """Compute reconstruction loss between input and decoded representation."""
     return F.l1_loss(x, decoder(h))
 
+'''
 def loss_mutual_info(h1, h2, z_components, all=True):
     """
     Maximize mutual information between original and projected representations.
@@ -148,6 +149,68 @@ def loss_mutual_info(h1, h2, z_components, all=True):
     loss1 = -torch.mean(torch.diagonal(logits1) - torch.logsumexp(logits1, dim=1))
     loss2 = -torch.mean(torch.diagonal(logits2) - torch.logsumexp(logits2, dim=1))
     
+    return (loss1 + loss2) / 2
+'''
+
+def loss_mutual_info(h1, h2, z_components, all=True):
+    """
+    Maximize mutual information between original and projected representations.
+    Supports mismatched dimensions by projecting to a common space.
+    """
+    class FixedProjector(torch.nn.Module):
+        def __init__(self, d_in, k, ortho=True, seed=0):
+            super().__init__()
+            g = torch.Generator().manual_seed(seed)
+            W = torch.randn(d_in, k, generator=g) / (d_in**0.5)
+            if 0:#ortho:
+                # QR for approximate orthonormal columns
+                Q, _ = torch.linalg.qr(W, mode='reduced')
+                W = Q
+            self.register_buffer('W', W, persistent=False)  # not learnable
+        def forward(self, x):
+            return x @ self.W  # [B,k]
+    if all:
+    # Concatenate modality-specific and shared components
+        z1 = torch.cat([z_components[0][0], z_components[1][1]], dim=1)
+        z2 = torch.cat([z_components[1][0], z_components[0][1]], dim=1)
+    else:
+        z1 = z_components[1][1]
+        z2 = z_components[0][1]
+    # Handle dimension mismatch
+    if h1.shape[1] != z1.shape[1]:
+        proj_dim = max(h1.shape[1], z1.shape[1])
+        if h1.shape[1] < proj_dim:
+            # padding = torch.zeros(h1.size(0), proj_dim - h1.shape[1], device=h1.device)
+            # h1 = torch.cat((h1, padding), dim=1)
+            h1 = FixedProjector(h1.shape[1], k=proj_dim, seed=123).to(h1.device)(h1)
+        if z1.shape[1] < proj_dim:
+            # padding = torch.zeros(z1.size(0), proj_dim - z1.shape[1], device=z1.device)
+            # z1 = torch.cat((z1, padding), dim=1)
+            z1 = FixedProjector(z1.shape[1], k=proj_dim, seed=223).to(z1.device)(z1)
+    if h2.shape[1] != z2.shape[1]:
+        proj_dim = max(h2.shape[1], z2.shape[1])
+        if h2.shape[1] < proj_dim:
+            # padding = torch.zeros(h2.size(0), proj_dim - h2.shape[1], device=h2.device)
+            # h2 = torch.cat((h2, padding), dim=1)
+            h2 = FixedProjector(h2.shape[1], k=proj_dim, seed=124).to(h2.device)(h2)
+        if z2.shape[1] < proj_dim:
+            # padding = torch.zeros(z2.size(0), proj_dim - z2.shape[1], device=z2.device)
+            # z2 = torch.cat((z2, padding), dim=1)
+            z2 = FixedProjector(z2.shape[1], k=proj_dim, seed=224).to(z2.device)(z2)
+    # Normalize representations
+    h1 = F.normalize(h1, dim=1)
+    h2 = F.normalize(h2, dim=1)
+    z1 = F.normalize(z1, dim=1)
+    z2 = F.normalize(z2, dim=1)
+    # Compute InfoNCE-style similarity
+    temp = 0.1
+    # logits1 = torch.mm(h1, z1.T) / temp
+    # logits2 = torch.mm(h2, z2.T) / temp
+    logits1 = (h1 @ z1.T) / 0.1
+    logits2 = (h2 @ z2.T) / 0.1
+    # Compute InfoNCE losses
+    loss1 = -torch.mean(torch.diagonal(logits1) - torch.logsumexp(logits1, dim=1))
+    loss2 = -torch.mean(torch.diagonal(logits2) - torch.logsumexp(logits2, dim=1))
     return (loss1 + loss2) / 2
 
 def loss_invariance_m(phi1, phi2, model):
