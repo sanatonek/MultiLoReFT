@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from sklearn.linear_model import LinearRegression, LogisticRegression
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, silhouette_score
 
 class SimilarityMLP(torch.nn.Module):
     def __init__(self, dim1, dim2, hidden_dim=256):
@@ -163,6 +163,16 @@ def evaluate_validation_loss(model, val_dataloader, device, verbose=False, final
     all_accuracies.append(compute_classification(z_n[1][1], all_labels[:,0]))
     acc_labels = ['Acc h1_out', 'Acc h2_out', 'Acc Zm1', 'Acc Zm2', 'Acc Zs1', 'Acc Zs2']
 
+    # also compute the silhouette scores
+    all_silhouette_scores = []
+    sil_labels = ['Silhouette h1_out', 'Silhouette h2_out', 'Silhouette Zm1', 'Silhouette Zm2', 'Silhouette Zs1', 'Silhouette Zs2']
+    all_silhouette_scores.append(silhouette_score(h1_outs.detach().cpu().numpy(), all_labels[:,0], metric='cosine'))
+    all_silhouette_scores.append(silhouette_score(h2_outs.detach().cpu().numpy(), all_labels[:,0], metric='cosine'))
+    all_silhouette_scores.append(silhouette_score(z_n[0][0].detach().cpu().numpy(), all_labels[:,0], metric='cosine'))
+    all_silhouette_scores.append(silhouette_score(z_n[1][0].detach().cpu().numpy(), all_labels[:,0], metric='cosine'))
+    all_silhouette_scores.append(silhouette_score(z_n[0][1].detach().cpu().numpy(), all_labels[:,0], metric='cosine'))
+    all_silhouette_scores.append(silhouette_score(z_n[1][1].detach().cpu().numpy(), all_labels[:,0], metric='cosine'))
+
     #phi1h2, phi2h1 = evaluate_cross_modal_retrieval(h1_outs, h2_outs, projector=model, device=device, labels=all_labels)
     if final:
         all_recalls = []
@@ -193,7 +203,7 @@ def evaluate_validation_loss(model, val_dataloader, device, verbose=False, final
             predictability_labels.append('Pred ' + regression_df.iloc[i]['name'])
 
         model.train()
-        return val_total_loss / len(val_dataloader), all_accuracies + predictabilities + all_recalls, acc_labels + predictability_labels + recall_labels
+        return val_total_loss / len(val_dataloader), all_accuracies + predictabilities + all_recalls + all_silhouette_scores, acc_labels + predictability_labels + recall_labels + sil_labels
     else:
         model.train()
         return val_total_loss / len(val_dataloader), all_accuracies, acc_labels
