@@ -68,6 +68,8 @@ def load_checkpoint(filepath, model, optimizer=None):
             model.R_s1 = nn.Parameter(torch.empty_like(state_dict["R_s1"]))
             model.register_parameter("R_s1", model.R_s1)
             model.W_s0[-1] = _patch_linear_layer(model.W_s0[-1], new_rank)
+            if "R_s2" not in state_dict:
+                model.W_s1[-1] = _patch_linear_layer(model.W_s1[-1], new_rank)
     if "R_s2" in state_dict:
         new_rank = state_dict["R_s2"].shape[0]
         if model.R_s2.shape[0] != new_rank:
@@ -93,7 +95,6 @@ def load_checkpoint(filepath, model, optimizer=None):
             model.R_m2 = nn.Parameter(torch.empty_like(state_dict["R_m2"]))
             model.register_parameter("R_m2", model.R_m2)
             model.W_m1[-1] = _patch_linear_layer(model.W_m1[-1], new_rank)
-
     # Now load the weights
     model.load_state_dict(state_dict, strict=False)
 
@@ -135,6 +136,10 @@ class SklearnTrainer:
         for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
             X_train, X_val = X[train_idx], X[val_idx]
             y_train, y_val = y[train_idx], y[val_idx]
+            if y_train.ndim > 1 and y_train.shape[1] == 1:
+                y_train = y_train.ravel()
+            if y_val.ndim > 1 and y_val.shape[1] == 1:
+                y_val = y_val.ravel()
 
             scaler = StandardScaler().fit(X_train)
             X_train = scaler.transform(X_train).squeeze()
@@ -168,6 +173,9 @@ class SklearnTrainer:
                 else:
                     y_pred = self.model.predict(X_val)
                 score = roc_auc_score(y_val, y_pred)
+                kmeans = KMeans(n_clusters=np.unique(y_val).shape[0], random_state=42)
+                score_1 = silhouette_score(X_val, kmeans.fit_predict(X_val))
+
 
             elif self.task_type == "multiclass":
                 self.model = LogisticRegression(max_iter=1000, solver='lbfgs')

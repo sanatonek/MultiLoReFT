@@ -82,40 +82,71 @@ def loss_reconstruction(h, x, decoder):
     """Compute reconstruction loss between input and decoded representation."""
     return F.l1_loss(x, decoder(h))
 
-def loss_mutual_info(h1, h2, z_components, all=True):
+def loss_mutual_info(h1, h2, z_components, mode="all"):
     """
     Maximize mutual information between original and projected representations.
     Supports mismatched dimensions by projecting to a common space.
     """
-    if all:
+    class FixedProjector(torch.nn.Module):
+        def __init__(self, d_in, k, ortho=True, seed=0):
+            super().__init__()
+            g = torch.Generator().manual_seed(seed)
+            W = torch.randn(d_in, k, generator=g) / (d_in**0.5)
+            if 0:#ortho:
+                # QR for approximate orthonormal columns
+                Q, _ = torch.linalg.qr(W, mode='reduced')
+                W = Q
+            self.register_buffer('W', W, persistent=False)  # not learnable
+
+        def forward(self, x):
+            return x @ self.W  # [B,k]
+
+    if mode=="all":
     # Concatenate modality-specific and shared components
-        z1 = torch.cat([z_components[0][0], z_components[1][1]], dim=1) 
-        z2 = torch.cat([z_components[1][0], z_components[0][1]], dim=1) 
-    else:
-        z1 = z_components[1][1]
-        z2 = z_components[0][1]
+        rnd = 1#torch.randint(0, 2, (1,)).item()
+        z1 = torch.cat([z_components[rnd][1], z_components[0][0]], dim=1) 
+        z2 = torch.cat([z_components[1-rnd][1], z_components[1][0]], dim=1) 
+    elif mode=="shared":
+        rnd = torch.randint(0, 2, (1,)).item()
+        z1 = z_components[rnd][1]
+        z2 = z_components[1-rnd][1]
+    elif mode=="private":
+        z1 = z_components[1][0]
+        z2 = z_components[0][0]
+    
+    # Handle dimension mismatch
+    if h1.shape[1] != z1.shape[1]:
+        proj_dim = max(h1.shape[1], z1.shape[1])
+        if h1.shape[1] < proj_dim:
+            # padding = torch.zeros(h1.size(0), proj_dim - h1.shape[1], device=h1.device)
+            # h1 = torch.cat((h1, padding), dim=1)
+            h1 = FixedProjector(h1.shape[1], k=proj_dim, seed=123).to(h1.device)(h1)
+        if z1.shape[1] < proj_dim:
+            # padding = torch.zeros(z1.size(0), proj_dim - z1.shape[1], device=z1.device)
+            # z1 = torch.cat((z1, padding), dim=1)
+            z1 = FixedProjector(z1.shape[1], k=proj_dim, seed=223).to(z1.device)(z1)
+    if h2.shape[1] != z2.shape[1]:
+        proj_dim = max(h2.shape[1], z2.shape[1])
+        if h2.shape[1] < proj_dim:
+            # padding = torch.zeros(h2.size(0), proj_dim - h2.shape[1], device=h2.device)
+            # h2 = torch.cat((h2, padding), dim=1)
+            h2 = FixedProjector(h2.shape[1], k=proj_dim, seed=124).to(h2.device)(h2)
+        if z2.shape[1] < proj_dim:
+            # padding = torch.zeros(z2.size(0), proj_dim - z2.shape[1], device=z2.device)
+            # z2 = torch.cat((z2, padding), dim=1)
+            z2 = FixedProjector(z2.shape[1], k=proj_dim, seed=224).to(z2.device)(z2)
     
     # Normalize representations
     h1 = F.normalize(h1, dim=1)
     h2 = F.normalize(h2, dim=1)
     z1 = F.normalize(z1, dim=1)
     z2 = F.normalize(z2, dim=1)
-    
-    # Handle dimension mismatch
-    if h1.shape[1] != z1.shape[1]:
-        proj_dim = min(h1.shape[1], z1.shape[1])
-        h1 = F.normalize(h1[:, :proj_dim], dim=1)
-        z1 = F.normalize(z1[:, :proj_dim], dim=1)
-    # Handle dimension mismatch
-    if h2.shape[1] != z2.shape[1]:
-        proj_dim = min(h2.shape[1], z2.shape[1])
-        h2 = F.normalize(h2[:, :proj_dim], dim=1)
-        z2 = F.normalize(z2[:, :proj_dim], dim=1)
-    
     # Compute InfoNCE-style similarity
     temp = 0.1
-    logits1 = torch.mm(h1, z1.T) / temp
-    logits2 = torch.mm(h2, z2.T) / temp
+    # logits1 = torch.mm(h1, z1.T) / temp
+    # logits2 = torch.mm(h2, z2.T) / temp
+    logits1 = (h1 @ z1.T) / 0.1
+    logits2 = (h2 @ z2.T) / 0.1
     
     # Compute InfoNCE losses
     loss1 = -torch.mean(torch.diagonal(logits1) - torch.logsumexp(logits1, dim=1))
@@ -221,6 +252,8 @@ def loss_orthogonality(R_s, R_m1, R_m2):
 
     # Use mean of squared cosine similarities instead of Frobenius norm directly
     def ortho_pair(A, B):
+        A = A / (A.norm(dim=1, keepdim=True) + 1e-6)
+        B = B / (B.norm(dim=1, keepdim=True) + 1e-6)
         prod = torch.mm(A, B.T)
         return (prod ** 2).mean()
 
@@ -260,56 +293,60 @@ def loss_shared_consistency(z_s1, z_s2):
     # cos_similarity = 1 - F.cosine_similarity(z_s1, z_s2, dim=1)
     # return torch.mean(cos_similarity)
 
-def rbf_kernel(x, sigma=None):
-    n = x.size(0)
+def rbf_kernel(x, sigma=None, eps=1e-12, return_sigma=True):
     x_norm = (x ** 2).sum(dim=1, keepdim=True)
-    dist_sq = x_norm + x_norm.t() - 2 * torch.mm(x, x.t())
+    dist_sq = (x_norm + x_norm.t() - 2 * (x @ x.t())).clamp_min_(0)
 
     if sigma is None:
-        dists = dist_sq.detach().clone()
-        dists = dists[~torch.eye(n, dtype=torch.bool, device=x.device)]
-        median_val = torch.median(dists)
-        # median_val = torch.clamp(median_val, min=1e-6)
-        sigma = torch.sqrt(0.5 * median_val)
+        n = x.size(0)
+        iu = torch.triu_indices(n, n, 1, device=x.device)
+        dists = dist_sq[iu[0], iu[1]]
+        nz = dists[dists > 0]
+        median_val = torch.median(nz) if nz.numel() > 0 else torch.mean(dists)
+        sigma = torch.sqrt(median_val / 2.0 + eps)
 
-    K = torch.exp(-dist_sq / (2 * (sigma ** 2)))
-    return K
+    K = torch.exp(-dist_sq / (2.0 * (sigma ** 2) + eps))
+    return K, sigma
 
 
-def hsic_rbf(x: torch.Tensor, y: torch.Tensor, sigma_x: float = None, sigma_y: float = None, unbiased: bool = True) -> torch.Tensor:
-    """
-    HSIC with Gaussian RBF kernel.
-    
-    Args:
-        x: (N, d_x)
-        y: (N, d_y)
-        sigma_x: bandwidth for RBF kernel on x
-        sigma_y: bandwidth for RBF kernel on y
-        unbiased: whether to use unbiased estimator
-    
-    Returns:
-        Scalar HSIC value
-    """
-    N = x.shape[0]
-    assert N == y.shape[0], "x and y must have the same number of samples"
+def hsic_rbf(X, Y, sigma_x=None, sigma_y=None, unbiased=False):
+    K, sigma_x = rbf_kernel(X, sigma=sigma_x) # <- unpack
+    L, sigma_y = rbf_kernel(Y, sigma=sigma_y)  # <- unpack
 
-    K = rbf_kernel(x, sigma_x)
-    L = rbf_kernel(y, sigma_y)
+    n = X.size(0)
+    H = torch.eye(n, device=X.device, dtype=X.dtype) - (1.0 / n)
+    Kc = H @ K @ H
+    Lc = H @ L @ H
 
     if unbiased:
-        K = K - torch.diag_embed(torch.diagonal(K, dim1=-2, dim2=-1))
-        L = L - torch.diag_embed(torch.diagonal(L, dim1=-2, dim2=-1))
-
-        hsic = torch.sum(K * L) / (N * (N - 3)) \
-             - 2 * torch.sum(K.sum(dim=0) * L.sum(dim=0)) / (N * (N - 2) * (N - 3)) \
-             + torch.sum(K) * torch.sum(L) / (N * (N - 1) * (N - 2) * (N - 3))
+        hsic = torch.trace(Kc @ Lc) / ((n - 3) * (n - 2) + 1e-12)  # or your preferred unbiased estimator
     else:
-        H = torch.eye(N, device=x.device) - (1.0 / N) * torch.ones((N, N), device=x.device)
-        Kc = H @ K @ H
-        Lc = H @ L @ H
-        hsic = torch.trace(Kc @ Lc) / ((N - 1) ** 2)
+        hsic = torch.trace(Kc @ Lc) / ((n - 1) ** 2 + 1e-12)
+    return hsic
+
+def hsic_linear(X, Y, unbiased=False):
+    """
+    Linear HSIC (i.e., cross-covariance Frobenius norm squared).
+    X: (n, d_x)
+    Y: (n, d_y)
+    """
+    n = X.size(0)
+
+    # Center the features
+    Xc = X - X.mean(dim=0, keepdim=True)
+    Yc = Y - Y.mean(dim=0, keepdim=True)
+
+    # Linear kernels = centered Gram matrices
+    Kc = Xc @ Xc.T
+    Lc = Yc @ Yc.T
+
+    if unbiased:
+        hsic = torch.trace(Kc @ Lc) / ((n - 3) * (n - 2) + 1e-12)
+    else:
+        hsic = torch.trace(Kc @ Lc) / ((n - 1)**2 + 1e-12)
 
     return hsic
+
 
 def hsic(x, y, sigma_x=None, sigma_y=None):
     """
@@ -321,8 +358,8 @@ def hsic(x, y, sigma_x=None, sigma_y=None):
         Scalar HSIC value.
     """
     n = x.size(0)
-    K = rbf_kernel(x, sigma_x)
-    L = rbf_kernel(y, sigma_y)
+    K = rbf_kernel(x, sigma_x)[0]
+    L = rbf_kernel(y, sigma_y)[0]
 
     H = torch.eye(n, device=x.device) - (1.0 / n) * torch.ones((n, n), device=x.device)
     Kc = torch.mm(H, torch.mm(K, H))
@@ -330,11 +367,12 @@ def hsic(x, y, sigma_x=None, sigma_y=None):
     hsic_val = torch.trace(torch.mm(Kc, Lc)) / ((n - 1)**2)
     return hsic_val
 
-def loss_independence(z_s1, z_s2, z_m1, z_m2):
+def loss_independence(z_s1, z_s2, z_m1, z_m2, mod):
     """
     Compute independence loss between shared and modality-specific representations.
     """
-    return hsic_rbf(z_s1, z_m1, unbiased=False) + hsic_rbf(z_s2, z_m2, unbiased=False)+ hsic_rbf(z_m1, z_m2, unbiased=False)
+    # return hsic_linear(z_s1, z_m1, unbiased=False) + hsic_linear(z_s2, z_m2, unbiased=False) + hsic_linear(z_m1, z_m2, unbiased=False) #+ hsic_rbf(z_s2, z_m1, unbiased=False)#+ hsic_rbf(z_m1, z_m2, unbiased=False)
+    return hsic_rbf(z_s1, z_m1, unbiased=True) + hsic_rbf(z_s2, z_m2, unbiased=True) + hsic_rbf(z_m1, z_m2, unbiased=True) #+ hsic_rbf(z_s2, z_m1, unbiased=True) + hsic_rbf(z_m2, z_s1, unbiased=True)
 
 
 def center_gram(gram):
