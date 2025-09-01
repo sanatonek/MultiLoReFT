@@ -5,15 +5,17 @@ import torch
 import matplotlib.pyplot as plt 
 import seaborn as sns
 from sklearn.decomposition import PCA
+import umap 
 from sim_data import generate_multimodal_data
 from torch.utils.data import Dataset, DataLoader
 from utils import *
 import numpy as np
-from multimodal_projector import MultimodalDataset, MultiLoReFT
+from multimodal_projector import MultiLoReFT
 from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge, Lasso
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.multioutput import MultiOutputRegressor
 from flickr import Multi30KMixedLangDataset
+from simulation import MultimodalDataset
 from vqa import VQADataset
 from cremad import CremadDataset
 from sklearn.metrics import r2_score, accuracy_score
@@ -124,14 +126,13 @@ def evaluate_predictability(components, labels, task_name, dataset_name):
     if is_classification:
         n_classes = len(np.unique(y))
         print(f"Predicting {task_name}: Classification ({n_classes} classes)")
+        metric_name = ["roc_auc_ovr", "silhouette_score"]
 
         if n_classes == 2:
-            model = Lasso(alpha=0.1)
-            metric_name = ["roc_auc"]
+            model = Lasso(alpha=0.1, max_iter=1000)
             task_type = "binary"
         else:
             model = LogisticRegression(max_iter=1000, solver='lbfgs')
-            metric_name = ["roc_auc_ovr", "silhouette_score"]
             task_type = "multiclass"
     else:
         if y.ndim > 1 and y.shape[1] > 1:
@@ -147,33 +148,25 @@ def evaluate_predictability(components, labels, task_name, dataset_name):
     
     performance_scores = []
     component_names = []
+    results_dict = {}
     for name, z in components:
+        z = z.detach().cpu().numpy() if torch.is_tensor(z) else z
         try:
             reg_model = SklearnTrainer(model=model, task_type=task_type)
-            if task_type == "multiclass":
-                score, score_var, score_1, score_var_1 = reg_model.train_and_evaluate(z.detach().cpu(), y, k=5)
+            if task_type in ["multiclass", "binary"]:
+                score, score_var, score_1, score_var_1 = reg_model.train_and_evaluate(z, y, k=5)
             else:
-                score, score_var = reg_model.train_and_evaluate(z.detach().cpu(), y, k=5)
+                score, score_var = reg_model.train_and_evaluate(z, y, k=5)
             performance_scores.append((score, score_var))
             component_names.append(name)
-            print(name, f"-----Predictive performance of {task_name}: ({metric_name[0]}): {score:.3f} (var: {score_var:.3f})")
-            if task_type == "multiclass":
-                print(name, f"-----Predictive performance of {task_name}: ({metric_name[1]}): {score_1:.3f} (var: {score_var_1:.3f})")
+            results_dict[name] = score
+            # print(name, f"-----Predictive performance of {task_name}: ({metric_name[0]}): {score:.3f} (var: {score_var:.3f})")
+            # if task_type in ["multiclass", "binary"]:
+            #     print(name, f"-----Predictive performance of {task_name}: ({metric_name[1]}): {score_1:.3f} (var: {score_var_1:.3f})")
         except Exception as e:
             print(f"Error evaluating {name}: {str(e)}")
             continue
-
-    # Create bar plot
-    scores, variances = zip(*performance_scores)
-    x_pos = np.arange(len(component_names))
-
-    plt.figure(figsize=(10, 6))
-    plt.bar(x_pos, scores, yerr=variances, align='center', alpha=0.7, capsize=10)
-    plt.xticks(x_pos, component_names, rotation=45, ha='right', fontsize=16)
-    plt.ylabel(f'Predictive Performance ({metric_name})', fontsize=16)
-    plt.title('Predictive Performance of Each Component', fontsize=18)
-    plt.tight_layout()
-    plt.savefig(f"plots/{dataset_name}/predictability_plot_{task_name}.png")
+    return results_dict
 
 
 
@@ -196,13 +189,19 @@ def plot_representations(z_n, labels, task_name, dataset_name, save_dir="./plots
     for title, i, j in titles:
         ax = axs[i, j]
         ax.set_title(title, fontsize=18)     
-        data = z_n[i*2+j].detach().cpu().numpy()
+        data = z_n[i*2+j]#.detach().cpu().numpy()
         
         if data.shape[1] >= 2:
             # Normal PCA case (2+ dimensions)
-            pca = PCA(n_components=2)
-            x = pca.fit_transform(data)
+            reducer = PCA(n_components=2)
+            # reducer = umap.UMAP()
+            x = reducer.fit_transform(data)
             ax.scatter(x[:, 0], x[:, 1], c=labels.cpu().numpy() if torch.is_tensor(labels) else labels)
+        # elif data.shape[1] == 2:
+        #     reducer = umap.UMAP(n_neighbors=10,min_dist=0.25,random_state=3)
+        #     x = reducer.fit_transform(data)
+        #     ax.scatter(x[:, 0], x[:, 1], c=labels.cpu().numpy() if torch.is_tensor(labels) else labels)
+            # ax.scatter(data[:, 0], data[:, 1], c=labels.cpu().numpy() if torch.is_tensor(labels) else labels)
         elif data.shape[1] == 1:
             # Handle 1D case by adding a zero column for visualization
             x = np.hstack([data, np.zeros_like(data)])
@@ -288,14 +287,8 @@ def plot_projection_matrices(model, threshold=0.00, save_dir="./plots"):
     plt.close()
 
 
-def main():
+def main(dataset_name, checkpoint_name):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='simulated', help='Dataset name (simulated or flickr)')
-    args = parser.parse_args()
-    dataset_name = args.dataset
-    if not os.path.exists('./plots/%s' % dataset_name):
-        os.makedirs('./plots/%s' % dataset_name)
     
     if dataset_name=="simulated":
         # Load and prepare data
@@ -316,9 +309,10 @@ def main():
             pruning_threshold=0.2,
             staging=True,
             pruning=True,
-            device=device
+            device=device,
+            shared_R_mode="pad"
         ).to(device)
-        projection_model = load_checkpoint(filepath="./ckpts/projection_module.pth", model=projection_model)
+        projection_model = load_checkpoint(filepath=checkpoint_name, model=projection_model)
         projection_model.eval()
         projection_model = projection_model.to(device)
         # Get representations
@@ -333,7 +327,46 @@ def main():
         prediction_labels = [labels[:,0], labels[:,1], labels[:,2]]
         task_names = ['shared', 'm1', 'm2']
         modality_names = ["A", "B"]
-    
+    elif dataset_name=="simulated_apollo":
+        # Load and prepare data
+        loaded_data = np.load("./data/simulated_data_apollo.npz")
+        h1 = loaded_data["h1"]
+        h2 = loaded_data["h2"]
+        x1 = loaded_data["x1"]
+        x2 = loaded_data["x2"]
+        labels = loaded_data["labels"]
+        n_train = int(0.8*len(h1))
+        n_val = int(0.1*len(h1))
+        n_test = len(h1) - n_train - n_val
+        # Create dataset
+        dataset = MultimodalDataset(h1[n_train+n_val:], h2[n_train+n_val:], x1[n_train+n_val:], x2[n_train+n_val:], labels[n_train+n_val:])  
+        # Load model
+        # Initialize model
+        projection_model = MultiLoReFT(
+            input_dims=[80,40], 
+            shared_rank=40, 
+            specific_rank=40, 
+            pruning_threshold=0.2,
+            staging=True,
+            pruning=True,
+            device=device,
+            shared_R_mode="pad"
+        ).to(device)
+        projection_model = load_checkpoint(filepath=checkpoint_name, model=projection_model)
+        projection_model.eval()
+        projection_model = projection_model.to(device)
+        # Get representations
+        h1 = torch.Tensor(h1[n_train+n_val:]).to(device)
+        h2 = torch.Tensor(h2[n_train+n_val:]).to(device)
+        phis = projection_model([h1,h2])
+        phi_1 = phis[0]
+        phi_2 = phis[1]
+        z = projection_model.fuse_representations(phis)
+        z_n = projection_model.decouple(phis, full=True, th=0.05)
+        z1m, z1s, z2m, z2s = z_n[0][0], z_n[0][1], z_n[1][0], z_n[1][1]
+        prediction_labels = [labels[n_train+n_val:,0], labels[n_train+n_val:,1]]
+        task_names = ['shared', 'm1']
+        modality_names = ["A", "B"]
     else:
         # Load CLIP (English only)
         clip_model, clip_preprocess = clip.load("ViT-B/32", device=device)
@@ -342,11 +375,15 @@ def main():
             test_dataset = Multi30KMixedLangDataset(split="test", device=device)
             check_point = "./ckpts/flickr_model_all.pth"
             projection_model = MultiLoReFT(
-                                        input_dims=[768,768], 
-                                        shared_rank=128, 
-                                        specific_rank=128, 
-                                        device=device
-                                    )
+                                    input_dims=[768,768], 
+                                    shared_rank=768, 
+                                    specific_rank=768, 
+                                    pruning_threshold=0.1,
+                                    device=device,
+                                    staging=True,
+                                    pruning=True,
+                                    dataset_name="flickr"
+                                ).to(device)
             modality_names = ["image", "caption"]
         elif dataset_name=="vqa":
             test_dataset = VQADataset(split="validation", device=device)
@@ -363,13 +400,14 @@ def main():
             test_dataset = CremadDataset(split='test')
             check_point = "./ckpts/cremad_model_all.pth"
             projection_model = MultiLoReFT(input_dims=[400, 768],   # adjust if needed: video_feat dim, audio_feat dim
-                                            shared_rank=512,
-                                            specific_rank=512,
+                                            shared_rank=768,
+                                            specific_rank=768,
                                             pruning_threshold=0.1,
                                             device=device,
                                             staging=True,
                                             pruning=True,
-                                            dataset_name="cremad"
+                                            dataset_name="cremad",
+                                            shared_R_mode="pad"
                                         ).to(device)
             modality_names = ["video", "audio"]
         test_dataloader = DataLoader(test_dataset, batch_size=256, shuffle=False)
@@ -403,7 +441,7 @@ def main():
                     h2.append(text_feats)
                     task_names = ['language', 'other_caption']
                 elif dataset_name=="cremad":
-                    video_feats, audio_feats, x1, x2, subject_id, sentence_id, emotion = batch
+                    video_feats, audio_feats, x1, x2, subject_id, sentence_id, emotion, age, sex, race, ethnicity = batch
                     sentence_refs = ['IEO', 'TIE', 'IOM', 'IWW', 'TAI', 'MTI', 'IWL', 'ITH', 'DFA', 'ITS', 'TSI', 'WSI']
                     emotion_refs = ['ANG', 'DIS', 'FEA', 'HAP', 'NEU', 'SAD']
                     subject_id = torch.Tensor([int(id) for id in subject_id])
@@ -411,8 +449,8 @@ def main():
                     emotion = torch.Tensor([emotion_refs.index(id) for id in emotion])
                     h1.append(video_feats)
                     h2.append(audio_feats)
-                    label = [subject_id, sentence_id, emotion]
-                    task_names = ['subject_id', 'sentence_id', 'emotion']
+                    label = [subject_id, sentence_id, emotion, age, sex, race, ethnicity]
+                    task_names = ['subject_id', 'sentence_id', 'emotion', 'age', 'sex', 'race', 'ethnicity']
                 elif dataset_name=="vqa":
                     image_feats, question_feats, x1, x2, answer, answer_feat = batch
                     h1.append(image_feats)
@@ -471,15 +509,15 @@ def main():
         prediction_labels = labels
 
     # Evaluate and plot
-    plot_projection_matrices(projection_model)
+    # plot_projection_matrices(projection_model)
     components = [
-        ("Zs1", z1s),  # Shared representation from modality 1
-        ("Zs2", z2s),  # Shared representation from modality 2
-        ("Zm1", z1m),  # Modality-specific representation from modality 1
-        ("Zm2", z2m),
-        ("Z", z),
-        ("H1", h1),
-        ("H2", h2)
+        ("Zs1", z1s.detach().cpu().numpy()),  # Shared representation from modality 1
+        ("Zs2", z2s.detach().cpu().numpy()),  # Shared representation from modality 2
+        ("Zm1", z1m.detach().cpu().numpy()),  # Modality-specific representation from modality 1
+        ("Zm2", z2m.detach().cpu().numpy()),
+        ("Z", z.detach().cpu().numpy()),
+        ("H1", h1.detach().cpu().numpy()),
+        ("H2", h2.detach().cpu().numpy())
     ] 
     z1 = torch.concat([z1m, z1s], dim=1)
     z2 = torch.concat([z2m, z2s], dim=1)
@@ -497,19 +535,57 @@ def main():
     print("Recall@10 predicting image from h2: ", res)
     for name, z in components:
         print(name, z.shape)
+    results_dict = []
     for task_ind, label_task in enumerate(prediction_labels):
         print(label_task.shape)
         # Fix: check if label_task[0] is a scalar (numpy.float64) or array
         if np.isscalar(label_task[0]) or (hasattr(label_task[0], 'shape') and label_task[0].shape == ()):  # scalar
             # handle scalar case
-            plot_representations((z1m, z1s, z2m, z2s), label_task, task_names[task_ind], dataset_name, modality_names=modality_names)
+            plot_representations((z1m.detach().cpu().numpy(), z1s.detach().cpu().numpy(), z2m.detach().cpu().numpy(), z2s.detach().cpu().numpy()), label_task, task_names[task_ind], dataset_name, modality_names=modality_names)
         else:
             # handle array case
-            plot_representations((z1m, z1s, z2m, z2s), label_task, task_names[task_ind], dataset_name, modality_names=modality_names)
-        evaluate_predictability(components, label_task, task_names[task_ind], dataset_name)
-    
+            plot_representations((z1m.detach().cpu().numpy(), z1s.detach().cpu().numpy(), z2m.detach().cpu().numpy(), z2s.detach().cpu().numpy()), label_task, task_names[task_ind], dataset_name, modality_names=modality_names)
+        results_dict.append(evaluate_predictability(components, label_task, task_names[task_ind], dataset_name))
+    return task_names, results_dict
     # Evaluate predictability for each label
 
 
 if __name__=="__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', type=str, default='simulated', help='Dataset name (simulated or flickr)')
+    args = parser.parse_args()
+    if not os.path.exists('./plots/%s' % args.dataset):
+        os.makedirs('./plots/%s' % args.dataset)
+    results_across_seeds = {}
+    for seed_id in range(4):
+        checkpoint_name = "./ckpts/%s_multi_loreft_%d.pth" % (args.dataset, seed_id)
+        task_names, results_dict = main(args.dataset, checkpoint_name)
+        for task_name, result in zip(task_names, results_dict):
+            if task_name not in results_across_seeds:
+                results_across_seeds[task_name] = []
+            results_across_seeds[task_name].append(result)
+    # print(results_across_seeds)
+    # Calculate mean and variance of results across seeds
+    for task_name, results in results_across_seeds.items():
+        # Calculate mean and variance for each component
+        component_names = list(results[0].keys())
+        
+        print(f"Task: {task_name}")
+        for component_name in component_names:
+            performance_scores = np.array([result[component_name] for result in results])
+            
+            mean_score = np.mean(performance_scores, axis=0)
+            var_score = np.var(performance_scores, axis=0)
+            print(f"Component: {component_name}, Mean Score: {mean_score:.3f}, Variance: {var_score:.3f}")
+            # Create bar plots of the performances for each component
+            # fig, ax = plt.subplots(figsize=(10, 6))
+            # x = np.arange(len(component_names))
+            # ax.bar(x, mean_scores, yerr=np.sqrt(var_scores), capsize=5, color='skyblue')
+            # ax.set_xticks(x)
+            # ax.set_xticklabels(component_names, rotation=45, ha='right')
+            # ax.set_ylabel('Performance Score')
+            # ax.set_title(f'Performance Scores for Task: {task_name}')
+            # plt.tight_layout()
+            # plt.savefig(f"./plots/{args.dataset}/{task_name}_performance_barplot.pdf")
+            # plt.close(fig)
+            # print(f"Saved bar plot to ./plots/{args.dataset}/{task_name}_performance_barplot.pdf")
