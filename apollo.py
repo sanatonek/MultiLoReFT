@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import argparse
 import os
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
@@ -10,6 +11,8 @@ from sim_data import generate_multimodal_data
 from sklearn.decomposition import PCA
 import seaborn as sns   
 from evaluate_representations import plot_representations, evaluate_predictability
+
+
 class MultimodalDataset(Dataset):
     """Dataset class for multimodal data."""
     def __init__(self, h1, h2, x1, x2, labels):
@@ -27,77 +30,96 @@ class MultimodalDataset(Dataset):
 
 
 class Apollo(nn.Module):
-    """
-    Simplified Multimodal representation fusion. This class integrates multiple
-    modalities (e.g., images, text, audio, etc.) into a unified representation space.
-
-    Attributes:
-        encoders (dict): A dictionary of pretrained unimodal encoder models, one for each modality.
-                         The key is the modality name identifier.
-        decoders (dict): A dictionary of decoder models (not pretrained), one for each modality.
-                         The key is the modality name identifier.
-        train_ids (list): A list of identifiers for training data, used for indexing or batching.
-        z_sizes (dict): Size of latent representation for each modality.
-        shared_size (int): Size of the shared representation.
-        modality_names (list): A list of names for each modality.
-        modality_shapes (dict): The input shape for samples of each modality.
-        ckpt_path (str): The path to the checkpoint directory where the model's trained parameters are stored or 
-                         loaded from.
-    """
     def __init__(self, encoders, decoders, n_train, z_sizes, shared_size,
                  modality_names, modality_shapes, ckpt_path):
         super(Apollo, self).__init__()
         self.z_sizes = z_sizes
         self.shared_size = shared_size
         self.n_train = n_train
-        self.n_modalitites = len(modality_names)
         self.modality_names = modality_names
         self.modality_shapes = modality_shapes
         self.ckpt_path = ckpt_path
-        # Initialize latent representations
-        self.posterior_means = {}
-        for mod, z_size in z_sizes.items():
-            self.posterior_means[mod] = nn.Parameter(torch.randn(self.n_train, z_size))
-        self.shared_post_mean = nn.Parameter(torch.randn(self.n_train, shared_size))
-        # Initialize pretrained models
-        self.encoders, self.decoders = {}, {}
-        for model_name in modality_names:
-            self.encoders[model_name] = encoders[model_name]
-            self.decoders[model_name] = decoders[model_name]
+
+        # Replace nn.Parameter with nn.Embedding for modality-specific latents
+        self.posterior_means = nn.ModuleDict({
+            mod: nn.Embedding(n_train, z_sizes[mod])
+            for mod in modality_names
+        })
+
+        # Shared latent embedding
+        self.shared_post_mean = nn.Embedding(n_train, shared_size)
+
+        # Encoders and decoders
+        self.encoders = nn.ModuleDict(encoders)
+        self.decoders = nn.ModuleDict(decoders)
+
+    def get_latents(self):
+        """Retrieve shared and modality-specific latent vectors for a batch."""
+        z_shared = self.shared_post_mean
+        z_mod = {
+            mod: self.posterior_means[mod]
+            for mod in self.modality_names
+        }
+        return z_shared, z_mod
+
+    def parameters_for_optim(self):
+        """Return all trainable parameters for the optimizer."""
+        return (
+            list(self.encoders.parameters()) +
+            list(self.decoders.parameters()) +
+            list(self.shared_post_mean.parameters()) +
+            [p for mod in self.modality_names for p in self.posterior_means[mod].parameters()]
+        )
 
     def load_from_checkpoint(self):
         ckpt_path = self.ckpt_path
         for modal_name in self.modality_names:
             self.encoders[modal_name].load_state_dict(torch.load(os.path.join(ckpt_path, f"{modal_name}_encoder.pth")))
             self.decoders[modal_name].load_state_dict(torch.load(os.path.join(ckpt_path, f"{modal_name}_decoder.pth")))
-            self.posterior_means[modal_name] = torch.from_numpy(np.load(os.path.join(ckpt_path, f"modality_z_{modal_name}.npy")))
-        self.shared_post_mean = torch.nn.Parameter(torch.from_numpy(np.load(os.path.join(ckpt_path, 'shared_z.npy'))))
+
+            z_mod = np.load(os.path.join(ckpt_path, f"modality_z_{modal_name}.npy"), allow_pickle=True)
+            if isinstance(z_mod, np.ndarray) and z_mod.dtype == np.object_:
+                z_mod = np.stack(z_mod)
+            self.posterior_means[modal_name].weight.data.copy_(torch.from_numpy(z_mod.astype(np.float32)))
+
+        z_shared = np.load(os.path.join(ckpt_path, 'shared_z.npy'), allow_pickle=True)
+        if isinstance(z_shared, np.ndarray) and z_shared.dtype == np.object_:
+            z_shared = np.stack(z_shared)
+        self.shared_post_mean.weight.data.copy_(torch.from_numpy(z_shared.astype(np.float32)))
+
 
     def save_to_checkpoint(self):
         os.makedirs(self.ckpt_path, exist_ok=True)
         for modal_name in self.modality_names:
-            torch.save(self.encoders[modal_name].state_dict(), os.path.join(self.ckpt_path, f"{modal_name}_encoder.pth"))
-            torch.save(self.decoders[modal_name].state_dict(), os.path.join(self.ckpt_path, f"{modal_name}_decoder.pth"))
-            np.save(os.path.join(self.ckpt_path, f"modality_z_{modal_name}.npy"), self.posterior_means[modal_name].detach().cpu().numpy())
-        np.save(os.path.join(self.ckpt_path, 'shared_z.npy'), self.shared_post_mean.detach().cpu().numpy())
+            torch.save(self.encoders[modal_name].state_dict(),
+                    os.path.join(self.ckpt_path, f"{modal_name}_encoder.pth"))
+            torch.save(self.decoders[modal_name].state_dict(),
+                    os.path.join(self.ckpt_path, f"{modal_name}_decoder.pth"))
+            # Save only the weights of the embeddings
+            np.save(os.path.join(self.ckpt_path, f"modality_z_{modal_name}.npy"),
+                    self.posterior_means[modal_name].weight.data.cpu().numpy())
+        
+        np.save(os.path.join(self.ckpt_path, 'shared_z.npy'),
+                self.shared_post_mean.weight.data.cpu().numpy())
 
-    def train(self, trainloader, lr_enc=0.001, lr_dec=0.001, epochs_enc=200, epochs_dec=200):
+
+    def train(self, trainloader, dataset_name, lr_enc=0.001, lr_dec=0.001, lr_optim=0.001, epochs_enc=20, epochs_dec=20, shared_labels=None):
         decoder_params = [param for mod in self.modality_names for param in self.decoders[mod].parameters()]
         encoder_params = [param for mod in self.modality_names for param in self.encoders[mod].parameters()]
-        posterior_means_params = [self.posterior_means[mod] for mod in self.modality_names]
+        posterior_means_params = list( self.posterior_means[self.modality_names[0]].parameters()) + list(self.posterior_means[self.modality_names[1]].parameters())
+        shared_params = list(self.shared_post_mean.parameters())
         
-        optimizer_dec = optim.Adam(decoder_params + posterior_means_params, lr=lr_dec)
+        optimizer_dec = optim.Adam(decoder_params, lr=lr_dec)
+        optimizer_latent = optim.Adam(posterior_means_params + shared_params, lr=lr_optim)
         optimizer_enc = optim.Adam(encoder_params, lr=lr_enc)
         # Save the model after training
 
 
-        self.save_to_checkpoint()
-
         # Train decoders and latent representations
-        dec_loss = self.optimize_latent(trainloader, lr_dec, epochs_dec, optimizer_dec)
-
+        dec_loss = self.optimize_latent(trainloader, lr_dec, epochs_dec, optimizer_dec, optimizer_latent, shared_labels)
         # Train encoders
         enc_loss = self.train_encoder(trainloader, lr_enc, epochs_enc, optimizer_enc)
+        self.save_to_checkpoint()
         plt.figure(figsize=(12, 6))
 
         # Plot decoder loss
@@ -118,13 +140,14 @@ class Apollo(nn.Module):
         plt.grid(True)
         plt.legend()
 
-        plt.savefig(os.path.join("./plots/apollo_loss_trend.png"))
+        plt.savefig(os.path.join("./plots/%s/apollo_loss_trend.png" % dataset_name))
         plt.show()
 
         return dec_loss, enc_loss
 
-    def optimize_latent(self, trainloader, lr, n_epochs, optimizer):
-        loss_fn = nn.MSELoss()
+    def optimize_latent(self, trainloader, lr, n_epochs, optimizer_dec, optimizer_latent, shared_labels):
+        mse_loss_fn = nn.MSELoss()
+        kl_loss_fn = nn.KLDivLoss(reduction='batchmean')
         loss_trend = []
         
         for epoch in range(n_epochs):
@@ -135,19 +158,36 @@ class Apollo(nn.Module):
                 for m_ind, (mod, z) in enumerate(self.posterior_means.items()):
                     x_m = data[m_ind]
                     batch_size = x_m.size(0)
-                    noise_m = torch.randn(batch_size, self.z_sizes[mod]) * 0.1
-                    noise_s = torch.randn(batch_size, self.shared_size) * 0.1
-                    z_m = z[batch_ind:batch_ind + batch_size] + noise_m
-                    z_s = self.shared_post_mean[batch_ind:batch_ind + batch_size] + noise_s
+                    noise_m = torch.randn(batch_size, self.z_sizes[mod]) * 0.5
+                    noise_s = torch.randn(batch_size, self.shared_size) * 0.5
+                    batch_ids = torch.arange(batch_ind, batch_ind + batch_size, device=z.weight.device)
+                    z_m = self.posterior_means[mod](batch_ids) + noise_m
+                    z_s = self.shared_post_mean(batch_ids) + noise_s
                     reconst = self.decoders[mod](z_s, z_m)
-                    loss = loss_fn(x_m, reconst)
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                    batch_loss += loss.item()
+                    
+                    # Calculate MSE loss
+                    mse_loss = mse_loss_fn(x_m, reconst)
+                    
+                    # Calculate KL divergence loss
+                    actDecay = 1e-3
+                    loss_lNorm_m = torch.mean(torch.linalg.norm(z_m, dim=1)) / z_m.size(1)
+                    loss_lNorm_s = torch.mean(torch.linalg.norm(z_s, dim=1)) / z_s.size(1)
+                    kl_loss = (loss_lNorm_m + loss_lNorm_s) * actDecay
+                    # Total loss
+                    total_loss = mse_loss + kl_loss
+                    
+                    optimizer_dec.zero_grad()
+                    optimizer_latent.zero_grad()
+                    total_loss.backward()
+                    optimizer_dec.step()
+                    optimizer_latent.step()
+                    batch_loss += total_loss.item()
                 batch_ind += batch_size     
                 epoch_loss.append(batch_loss) 
-            loss_trend.append(np.mean(epoch_loss))      
+            loss_trend.append(np.mean(epoch_loss))  
+            # if epoch % 100 == 0:
+            #     plot_representations((self.posterior_means["A"].weight.data.cpu().numpy(), self.posterior_means["B"].weight.data.cpu().numpy(), self.shared_post_mean.weight.data.cpu().numpy(), self.shared_post_mean.weight.data.cpu().numpy()), 
+            #                 shared_labels, 'shared_apollo', dataset_name="simulated_apollo", modality_names=["A", "B"])    
         return loss_trend
 
     def train_encoder(self, trainloader, lr, n_epochs, optimizer):
@@ -161,8 +201,9 @@ class Apollo(nn.Module):
                     x_m = batch[m_ind]
                     batch_size = x_m.size(0)
                     z_s, z_m = encoder(x_m)
-                    shared_mse = (self.shared_post_mean[batch_ind:batch_ind + batch_size] - z_s) ** 2
-                    mod_mse = (self.posterior_means[mod][batch_ind:batch_ind + batch_size] - z_m) ** 2
+                    batch_ids = torch.arange(batch_ind, batch_ind + batch_size, device=z_s.device)
+                    shared_mse = (self.shared_post_mean(batch_ids) - z_s) ** 2
+                    mod_mse = (self.posterior_means[mod](batch_ids) - z_m) ** 2
                     loss = shared_mse.mean() + mod_mse.mean()
                     optimizer.zero_grad()
                     loss.backward()
@@ -223,37 +264,42 @@ class Apollo(nn.Module):
         return frobenius_norm
 
 
-def main():
+def main(dataset_name):
     """Main function to run the training pipeline."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    from sim_data import generate_multimodal_data
     
     # Generate and load data
-    try:
+    if dataset_name == "simulated_apollo":
+        loaded_data = np.load("./data/simulated_data_apollo.npz")
+        input_dims = [80,40]
+        shared_rank, specific_rank = 20, 20
+    elif dataset_name == "simulated":
         loaded_data = np.load("./data/simplest_sim_nongaussian.npz")
-    except FileNotFoundError:
-        # Create data directory if it doesn't exist
-        os.makedirs("./data", exist_ok=True)
-        h1, h2, x1, x2, labels = generate_multimodal_data(
-            n_samples=6000, mod_dim=10, save_path="./data/simulated_data.npz")
-        loaded_data = np.load("./data/simulated_data.npz")
+        input_dims = [10,10]
+        shared_rank, specific_rank = 5, 5
     h1, h2, x1, x2, labels = loaded_data["h1"], loaded_data["h2"], loaded_data["x1"], loaded_data["x2"], loaded_data["labels"]
+    n_train = int(0.8*len(h1))
+    n_val = int(0.1*len(h1))
+    n_test = len(h1) - n_train - n_val
     # Create datasets
-    dataset = MultimodalDataset(h1[:4000], h2[:4000], x1[:4000], x2[:4000], labels[:4000])
-    val_dataset = MultimodalDataset(h1[4000:5000], h2[4000:5000], x1[4000:5000], x2[4000:5000], labels[4000:5000])
+    dataset = MultimodalDataset(h1[:n_train], h2[:n_train], x1[:n_train], x2[:n_train], labels[:n_train])
+    val_dataset = MultimodalDataset(h1[n_train:n_train+n_val], h2[n_train:n_train+n_val], x1[n_train:n_train+n_val], x2[n_train:n_train+n_val], labels[n_train:n_train+n_val])
+    test_dataset = MultimodalDataset(h1[n_train+n_val:], h2[n_train+n_val:], x1[n_train+n_val:], x2[n_train+n_val:], labels[n_train+n_val:])
     
     # Create dataloaders
-    dataloader = DataLoader(dataset, batch_size=512, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=512, shuffle=False)
     val_dataloader = DataLoader(val_dataset, batch_size=512, shuffle=True)
 
     class Encoder(nn.Module):
         def __init__(self, input_size, shared_size, modality_specific_size):
             super(Encoder, self).__init__()
-            self.fc1 = nn.Linear(input_size, input_size * 2)
-            self.fc2_shared = nn.Linear(input_size * 2, shared_size)
-            self.fc2_modality_specific = nn.Linear(input_size * 2, modality_specific_size)
+            hidden_size = 20
+            self.fc1 = nn.Linear(input_size, hidden_size)
+            self.fc2_shared = nn.Linear(hidden_size, shared_size)
+            self.fc2_modality_specific = nn.Linear(hidden_size, modality_specific_size)
 
         def forward(self, x):
+            x = F.normalize(x, p=2, dim=1)
             x = F.relu(self.fc1(x))
             z_shared = self.fc2_shared(x)
             z_modality_specific = self.fc2_modality_specific(x)
@@ -262,8 +308,9 @@ def main():
     class Decoder(nn.Module):
         def __init__(self, output_size, shared_size, modality_specific_size):
             super(Decoder, self).__init__()
-            self.fc1 = nn.Linear(shared_size + modality_specific_size, output_size * 2)
-            self.fc2 = nn.Linear(output_size * 2, output_size)
+            hidden_size = 20    
+            self.fc1 = nn.Linear(shared_size + modality_specific_size, hidden_size)
+            self.fc2 = nn.Linear(hidden_size, output_size)
 
         def forward(self, z_shared, z_modality_specific):
             z = torch.cat([z_shared, z_modality_specific], dim=-1)
@@ -271,12 +318,19 @@ def main():
             h = self.fc2(h)
             return h
 
+    if dataset_name == "simulated_apollo":
+        prediction_labels = [labels[n_train+n_val:,0], labels[n_train+n_val:,1]]#, labels[n_train+n_val:,2]]
+        # prediction_labels = [labels[:n_train,0], labels[:n_train,1]]#, labels[n_train+n_val:,2]]
+        task_names = ['shared_apollo', 'A_apollo']#, 'B_apollo']
+    elif dataset_name == "simulated":
+        prediction_labels = [labels[n_train+n_val:,0], labels[n_train+n_val:,1], labels[n_train+n_val:,2]]
+        task_names = ['Shared', 'A-specific', 'B-specific']
     # Initialize encoders for each modality
-    test_batch = {"A": torch.Tensor(h1[5000:]), "B": torch.Tensor(h2[5000:])}
-    z_sizes = {"A": 5, "B": 5}
-    shared_size = 10
+    test_batch = {"A": torch.Tensor(h1[n_train+n_val:]), "B": torch.Tensor(h2[n_train+n_val:])}
+    z_sizes = {"A": specific_rank, "B": specific_rank}
+    shared_size = shared_rank
     modality_names = ["A", "B"]
-    h_sizes = {"A": 10, "B": 10}
+    h_sizes = {"A": input_dims[0], "B": input_dims[1]}
     encoders = {
         mod: Encoder(input_size=h_sizes[mod], shared_size=shared_size, modality_specific_size=z_sizes[mod])
         for mod in modality_names
@@ -285,68 +339,41 @@ def main():
         mod: Decoder(output_size=h_sizes[mod], shared_size=shared_size, modality_specific_size=z_sizes[mod])
         for mod in modality_names
     }
-    model = Apollo(encoders, decoders, n_train=4000, z_sizes=z_sizes, shared_size=shared_size, modality_names=modality_names, modality_shapes=h_sizes, ckpt_path="./checkpoints/apollo")
-    dec_loss, enc_loss = model.train(dataloader, lr_enc=0.001, lr_dec=0.001, epochs_enc=200, epochs_dec=200)
-    model.load_from_checkpoint()
+    model = Apollo(encoders, decoders, n_train=n_train, z_sizes=z_sizes, shared_size=shared_size, modality_names=modality_names, modality_shapes=h_sizes, ckpt_path="./checkpoints/apollo")
+    dec_loss, enc_loss = model.train(dataloader, dataset_name=dataset_name, lr_enc=0.001, lr_dec=0.0001, lr_optim=0.001, epochs_enc=2000, epochs_dec=2000, shared_labels=prediction_labels[0])
+    # model.load_from_checkpoint()
     z_s_all, z_m_all = model.encode(test_batch)
-
+    # z_s_all, z_m_all = model.get_latents()
+    # components = [
+    #             ("Zs1", model.shared_post_mean.weight.data.cpu().numpy()),  # Shared representation from modality 1
+    #             ("Zs2", model.shared_post_mean.weight.data.cpu().numpy()),  # Shared representation from modality 2
+    #             ("Zm1", model.posterior_means["A"].weight.data.cpu().numpy()),  # Modality-specific representation from modality 1
+    #             ("Zm2", model.posterior_means["B"].weight.data.cpu().numpy()),
+    #         ] 
 
     components = [
-            ("Zs1", z_s_all["A"]),  # Shared representation from modality 1
-            ("Zs2", z_s_all["B"]),  # Shared representation from modality 2
-            ("Zm1", z_m_all["A"]),  # Modality-specific representation from modality 1
-            ("Zm2", z_m_all["B"]),
+            ("Zs1", z_s_all["A"].detach().cpu().numpy()),  # Shared representation from modality 1
+            ("Zs2", z_s_all["B"].detach().cpu().numpy()),  # Shared representation from modality 2
+            ("Zm1", z_m_all["A"].detach().cpu().numpy()),  # Modality-specific representation from modality 1
+            ("Zm2", z_m_all["B"].detach().cpu().numpy()),
         ] 
-    prediction_labels = [labels[5000:,0], labels[5000:,1], labels[5000:,2]]
-    task_names = ['shared', 'A', 'B']
+    
     # z1 = torch.concat([z1m, z1s], dim=1)
     # z2 = torch.concat([z2m, z2s], dim=1)
-    for name, z in components:
-        print(name, z.shape)
     for task_ind, label_task in enumerate(prediction_labels):
         print(label_task.shape)
         label_task = label_task.squeeze()
-        plot_representations((z_m_all["A"], z_m_all["B"], z_s_all["A"], z_s_all["B"]), label_task, task_names[task_ind], "apollo_simulation", modality_names=["A", "B"])
-        evaluate_predictability(components, label_task, task_names[task_ind], "apollo_simulation")
-
-
-
-
-    # # Assuming z_s_all and z_m_all are dictionaries with modality names as keys
-    # # and tensors of shape (num_samples, feature_dim) as values
-    # for label in range(3):  # Assuming there are 3 labels
-    #     fig, axes = plt.subplots(2, 2, figsize=(12, 12))
-    #     fig.suptitle(f'PCA Projection for Label {label}')
-    #     labels_test = labels[5000:, label]
-
-    #     for i, (modality, z_s) in enumerate(z_s_all.items()):
-    #         # Filter based on label
-
-    #         # Perform PCA
-    #         pca_s = PCA(n_components=2)
-    #         pca_m = PCA(n_components=2)
-    #         z_s_pca = pca_s.fit_transform(z_s_all[modality].detach().cpu().numpy())
-    #         z_m_pca = pca_m.fit_transform(z_m_all[modality].detach().cpu().numpy())
-
-    #         # Plot shared component
-    #         axes[i, 0].scatter(z_s_pca[:, 0], z_s_pca[:, 1], c=labels_test)
-    #         axes[i, 0].set_title('Shared Component')
-    #         axes[i, 0].set_xlabel('PC1')
-    #         axes[i, 0].set_ylabel('PC2')
-
-    #         # Plot modality-specific component
-    #         axes[i, 1].scatter(z_m_pca[:, 0], z_m_pca[:, 1], c=labels_test)
-    #         axes[i, 1].set_title('Modality-Specific Component')
-    #         axes[i, 1].set_xlabel('PC1')
-    #         axes[i, 1].set_ylabel('PC2')
-
-    #     # for ax in axes:
-    #     #     ax.legend()
-    #     #     ax.grid(True)
-
-    #     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    #     plt.savefig(os.path.join(f"./plots/apollo_pca_projection_label_{label}.png"))
+        # plot_representations((model.posterior_means["A"].weight.data.cpu().numpy(), model.posterior_means["B"].weight.data.cpu().numpy(), model.shared_post_mean.weight.data.cpu().numpy(), model.shared_post_mean.weight.data.cpu().numpy()), 
+        #                     label_task, task_names[task_ind], dataset_name="simulated_apollo", modality_names=["A", "B"])
+        plot_representations((z_m_all["A"].detach().cpu().numpy(), z_s_all["A"].detach().cpu().numpy(), z_m_all["B"].detach().cpu().numpy(), z_s_all["B"].detach().cpu().numpy()), label_task, task_names[task_ind], dataset_name=dataset_name, modality_names=["A", "B"])
+        result_dict = evaluate_predictability(components, label_task, task_names[task_ind], dataset_name)
+        print(result_dict)
     
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='Run multimodal projection training.')
+    parser.add_argument('--dataset_name', type=str, choices=['simulated', 'simulated_apollo'], default='simulated',
+                        help='Type of dataset to use: either "simulated" or "simulated_apollo".')
+    args = parser.parse_args()
+    dataset_name = args.dataset_name
+    main(dataset_name)
