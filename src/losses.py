@@ -397,51 +397,54 @@ def _rbf_kernel(x: torch.Tensor, sigma: float = None, eps: float = 1e-8) -> torc
     K = torch.exp(-gamma * dist_sq)
     return K
 
-def rbf_kernel(x, sigma=None):
+def rbf_kernel(x, sigma=None, eps=1e-12, return_sigma=True):
     n = x.size(0)
     x_norm = (x ** 2).sum(dim=1, keepdim=True)
-    dist_sq = x_norm + x_norm.t() - 2 * torch.mm(x, x.t())
+    dist_sq = (x_norm + x_norm.t() - 2 * (x @ x.t())).clamp_min_(0)
     if sigma is None:
-        dists = dist_sq.detach().clone()
-        dists = dists[~torch.eye(n, dtype=torch.bool, device=x.device)]
-        median_val = torch.median(dists)
-        # median_val = torch.clamp(median_val, min=1e-6)
-        sigma = torch.sqrt(0.5 * median_val)
-    K = torch.exp(-dist_sq / (2 * (sigma ** 2)))
-    return K
+        n = x.size(0)
+        iu = torch.triu_indices(n, n, 1, device=x.device)
+        dists = dist_sq[iu[0], iu[1]]
+        nz = dists[dists > 0]
+        median_val = torch.median(nz) if nz.numel() > 0 else torch.mean(dists)
+        sigma = torch.sqrt(median_val / 2.0 + eps)
 
-def hsic_rbf(x: torch.Tensor, y: torch.Tensor, sigma_x: float = None, sigma_y: float = None, unbiased: bool = True) -> torch.Tensor:
-    """
-    HSIC with Gaussian RBF kernel.
-    
-    Args:
-        x: (N, d_x)
-        y: (N, d_y)
-        sigma_x: bandwidth for RBF kernel on x
-        sigma_y: bandwidth for RBF kernel on y
-        unbiased: whether to use unbiased estimator
-    
-    Returns:
-        Scalar HSIC value
-    """
-    N = x.shape[0]
-    assert N == y.shape[0], "x and y must have the same number of samples"
+    K = torch.exp(-dist_sq / (2.0 * (sigma ** 2) + eps))
+    return K, sigma
 
-    K = _rbf_kernel(x, sigma_x)
-    L = _rbf_kernel(y, sigma_y)
+def hsic_rbf(X, Y, sigma_x=None, sigma_y=None, unbiased=False):
+    K, sigma_x = rbf_kernel(X, sigma=sigma_x) # <- unpack
+    L, sigma_y = rbf_kernel(Y, sigma=sigma_y)  # <- unpack
+    n = X.size(0)
+    H = torch.eye(n, device=X.device, dtype=X.dtype) - (1.0 / n)
+    Kc = H @ K @ H
+    Lc = H @ L @ H
 
     if unbiased:
-        K = K - torch.diag_embed(torch.diagonal(K, dim1=-2, dim2=-1))
-        L = L - torch.diag_embed(torch.diagonal(L, dim1=-2, dim2=-1))
-
-        hsic = torch.sum(K * L) / (N * (N - 3)) \
-             - 2 * torch.sum(K.sum(dim=0) * L.sum(dim=0)) / (N * (N - 2) * (N - 3)) \
-             + torch.sum(K) * torch.sum(L) / (N * (N - 1) * (N - 2) * (N - 3))
+        hsic = torch.trace(Kc @ Lc) / ((n - 3) * (n - 2) + 1e-12)  # or your preferred unbiased estimator
     else:
-        H = torch.eye(N, device=x.device) - (1.0 / N) * torch.ones((N, N), device=x.device)
-        Kc = H @ K @ H
-        Lc = H @ L @ H
-        hsic = torch.trace(Kc @ Lc) / ((N - 1) ** 2)
+        hsic = torch.trace(Kc @ Lc) / ((n - 1) ** 2 + 1e-12)
+    return hsic
+
+def hsic_linear(X, Y, unbiased=False):
+    """
+    Linear HSIC (i.e., cross-covariance Frobenius norm squared).
+    X: (n, d_x)
+    Y: (n, d_y)
+    """
+    n = X.size(0)
+    # Center the features
+    Xc = X - X.mean(dim=0, keepdim=True)
+    Yc = Y - Y.mean(dim=0, keepdim=True)
+
+    # Linear kernels = centered Gram matrices
+    Kc = Xc @ Xc.T
+    Lc = Yc @ Yc.T
+
+    if unbiased:
+        hsic = torch.trace(Kc @ Lc) / ((n - 3) * (n - 2) + 1e-12)
+    else:
+        hsic = torch.trace(Kc @ Lc) / ((n - 1)**2 + 1e-12)
 
     return hsic
 
@@ -455,8 +458,8 @@ def hsic(x, y, sigma_x=None, sigma_y=None):
         Scalar HSIC value.
     """
     n = x.size(0)
-    K = rbf_kernel(x, sigma_x) # NOT DEFINED
-    L = rbf_kernel(y, sigma_y)
+    K = rbf_kernel(x, sigma_x)[0]
+    L = rbf_kernel(y, sigma_y)[0]
 
     H = torch.eye(n, device=x.device) - (1.0 / n) * torch.ones((n, n), device=x.device)
     Kc = torch.mm(H, torch.mm(K, H))
