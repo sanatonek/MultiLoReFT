@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import gc
 from transformers import BertTokenizer, AutoTokenizer
+from collections import defaultdict
 from src.losses import loss_shared_consistency, loss_orthogonality, loss_mutual_info, GradientNormalizedLoss, loss_independence
 from src.visualization import plot_losses
 from src.utils import custom_weight_init, log_wandb
@@ -18,6 +19,7 @@ class MultiLoReFT(nn.Module):
             specific_rank, 
             staging=True, 
             encoders=None, 
+            #shared_R_mode="double",
             pruning_threshold=0.05, 
             pruning=True, 
             w_init=None,
@@ -60,6 +62,9 @@ class MultiLoReFT(nn.Module):
         self.verbose = verbose
         self.wandb_log = wandb_log
         self.intervene_layer = intervene_layer
+        #self.shared_R_mode = shared_R_mode
+        self.input_dims = input_dims
+        self.max_dim = max(input_dims)
         
         # Initialize projection matrices
         self.R_s = nn.Parameter(torch.empty(shared_rank, max(input_dims[0], input_dims[1]), dtype=torch.float32))
@@ -128,66 +133,126 @@ class MultiLoReFT(nn.Module):
     def prune_singular_values(self, single=False, threshold=0.1):
         """Prune singular values below threshold and update network weights."""
         def prune_matrix(name, R, weights_to_prune):
-            U, S, V = torch.svd(R)
-            if len(S) < 2:
-                return R, len(S)
+            #U, S, V = torch.svd(R)
+            #if len(S) < 2:
+            #    return R, len(S)
+            if R.shape[0] < 3:
+                return R, R.shape[0], False
+            U, S, Vh = torch.linalg.svd(R, full_matrices=False)
             
             if single:
                 # Original code that removes one at a time
                 min_sv_idx = torch.argmin(S)
                 min_sv = S[min_sv_idx]
                 if min_sv > self.pruning_threshold:
-                    return R, len(S)
+                    return R, len(S), False
                 
+                n_remove = 1
                 # Create mask for keeping dimensions
-                keep_indices = torch.ones(R.shape[0], dtype=torch.bool)
-                keep_indices[:len(S)][min_sv_idx] = False
-                reduced_R = R[keep_indices, :]
+                #keep_indices = torch.ones(R.shape[0], dtype=torch.bool)
+                #keep_indices[:len(S)][min_sv_idx] = False
+                #reduced_R = R[keep_indices, :]
             else:
                 keep_indices = torch.ones(R.shape[0], dtype=torch.bool)
                 below_threshold = S < self.pruning_threshold
                 num_below = below_threshold.sum().item()
                 if num_below == 0:
-                    return R, len(S)
+                    return R, len(S), False
                 # Calculate number to remove (between 1-10% of matrix size)
                 n_remove = max(1, min(num_below, int(threshold * len(S))))
                 # Get indices of n smallest singular values
-                smallest_n_idx = torch.argsort(S)[:n_remove]
-                keep_indices[:len(S)][smallest_n_idx] = False
-                reduced_R = R[keep_indices, :]
+                #smallest_n_idx = torch.argsort(S)[:n_remove]
+                #keep_indices[:len(S)][smallest_n_idx] = False
+                #reduced_R = R[keep_indices, :]
+            k = R.shape[0] - n_remove  # or choose by threshold
+            reduced_R = (S[:k].unsqueeze(1) * Vh[:k, :])        # diag(S_n) @ Vh_n
+            reduced_R = reduced_R.to(device=self.device, dtype=torch.float32)
+            UkT = U[:,:k].T
             
             # Update weight networks
-            for weight_seq in weights_to_prune:
+            for i, weight_seq in enumerate(weights_to_prune):
                 last_layer = weight_seq[-1]
-                in_features = last_layer.in_features
-                new_layer = nn.Linear(in_features, keep_indices.sum().item(), dtype=torch.float32)
-                new_layer.weight.data = last_layer.weight.data[keep_indices, :]
-                new_layer.bias.data = last_layer.bias.data[keep_indices]
-                weight_seq[-1] = new_layer
+                #in_features = last_layer.in_features
+                #new_layer = nn.Linear(in_features, keep_indices.sum().item(), dtype=torch.float32)
+                #new_layer.weight.data = last_layer.weight.data[keep_indices, :]
+                #new_layer.bias.data = last_layer.bias.data[keep_indices]
+                #weight_seq[-1] = new_layer
+                assert isinstance(last_layer, nn.Linear), "Expected last layer to be nn.Linear"
+                in_features  = last_layer.in_features    # keep same
+                out_old      = last_layer.out_features   # D_old
+
+                device = last_layer.weight.device
+                dtype  = last_layer.weight.dtype
+
+                # Build new last layer with out_features = k
+                new_last = nn.Linear(in_features, k, bias=True, device=device, dtype=dtype)
+
+                with torch.no_grad():
+                    # Rotate rows by Uk^T so that z_new = Uk^T z_old
+                    # old W maps h -> z_old in R^{D_old}; we want h -> z_new in R^{k}
+                    new_last.weight.copy_(UkT @ last_layer.weight.data)  # (in_features, k)
+                    if last_layer.bias is not None:
+                        new_last.bias.copy_(UkT @ last_layer.bias.data)  # (k,)
+                    else:
+                        nn.init.zeros_(new_last.bias)
+                weight_seq[-1] = new_last
+            UkT = U[:, :k].T
             
             # Update parameter
-            del self._parameters[name]
-            self.register_parameter(name, nn.Parameter(reduced_R))
+            #del self._parameters[name]
+            #self.register_parameter(name, nn.Parameter(reduced_R))
             #print(f">>>>>>>>>>>>>>>>>> Pruned %s to %d dimensions "%(name, len(reduced_R)))
-            return getattr(self, name), keep_indices.sum().item()
+            self.stage_tracking["plateau_counter"] = 0
+            #return getattr(self, name), keep_indices.sum().item()
+            return reduced_R, k, True
         
         # Prune each matrix
         kept_s, kept_m1, kept_m2 = 0, 0, 0
-        if len(self.R_s) > 2:
-            self.R_s, kept_s = prune_matrix("R_s", self.R_s, [self.W_s0, self.W_s1])
-            self.shared_rank = kept_s
-        if len(self.R_m1) > 2:
-            self.R_m1, kept_m1 = prune_matrix("R_m1", self.R_m1, [self.W_m0])
+        #if len(self.R_s) > 2:
+        #    self.R_s, kept_s = prune_matrix("R_s", self.R_s, [self.W_s0, self.W_s1])
+        #    self.shared_rank = kept_s
+        #if len(self.R_m1) > 2:
+        #    self.R_m1, kept_m1 = prune_matrix("R_m1", self.R_m1, [self.W_m0])
+        #    self.specific_rank = kept_m1
+        #if len(self.R_m2) > 2:
+        #    self.R_m2, kept_m2 = prune_matrix("R_m2", self.R_m2, [self.W_m1])
+        #    self.specific_rank = kept_m2
+        if self.shared_R_mode == "double":
+            pruned_R, kept_s1, is_pruned = prune_matrix("R_s1", self.R_s1, [self.W_s0])
+            if is_pruned:
+                self.shared_rank = kept_s1
+                self.R_s1 = torch.nn.Parameter(pruned_R)
+                self.optimizer.param_groups[0]['params'] =  [self.R_s1, self.R_s2] + list(self.W_s0.parameters()) + list(self.W_s1.parameters())
+            pruned_R, kept_s2, is_pruned = prune_matrix("R_s2", self.R_s2, [self.W_s1])
+            if is_pruned:
+                self.shared_rank = kept_s2
+                self.R_s2 = torch.nn.Parameter(pruned_R)
+                self.optimizer.param_groups[0]['params'] =  [self.R_s1, self.R_s2] + list(self.W_s0.parameters()) + list(self.W_s1.parameters())
+                
+        else:
+            pruned_R, kept_s1, is_pruned = prune_matrix("R_s1", self.R_s1, [self.W_s0, self.W_s1])
+            if is_pruned:
+                self.shared_rank = kept_s1
+                self.R_s1 = torch.nn.Parameter(pruned_R)
+                self.optimizer.param_groups[0]['params'] = [self.R_s1] + list(self.W_s0.parameters()) + list(self.W_s1.parameters())
+        
+        pruned_R, kept_m1, is_pruned = prune_matrix("R_m1", self.R_m1, [self.W_m0])
+        if is_pruned:
             self.specific_rank = kept_m1
-        if len(self.R_m2) > 2:
-            self.R_m2, kept_m2 = prune_matrix("R_m2", self.R_m2, [self.W_m1])
+            self.R_m1 = torch.nn.Parameter(pruned_R)
+            self.optimizer.param_groups[1]['params'] = [self.R_m1, self.R_m2] + list(self.W_m0.parameters()) + list(self.W_m1.parameters())
+        pruned_R, kept_m2, is_pruned = prune_matrix("R_m2", self.R_m2, [self.W_m1])
+        if is_pruned:
             self.specific_rank = kept_m2
+            self.R_m2 = torch.nn.Parameter(pruned_R)
+            self.optimizer.param_groups[1]['params'] = [self.R_m1, self.R_m2] + list(self.W_m0.parameters()) + list(self.W_m1.parameters())
+        self.optimizer.state = defaultdict(dict, self.optimizer.state)
         
         # print(f"Pruned dimensions: Shared kept {kept_s}, Modality1 kept {kept_m1}, Modality2 kept {kept_m2}")
          
-    def update_optimizer(self, optimizer):
-        optimizer.param_groups[0].update({"params": self.get_trainable_parameters()})
-        return optimizer   
+    #def update_optimizer(self, optimizer):
+    #    optimizer.param_groups[0].update({"params": self.get_trainable_parameters()})
+    #    return optimizer   
     
     def forward(self, embeddings):
         h1 = F.normalize(embeddings[0], p=2, dim=-1)
@@ -266,36 +331,33 @@ class MultiLoReFT(nn.Module):
     def compute_stage_losses(self, h1, h2, z_components):
         # Compute all losses
         #l_shared = loss_shared_consistency(z_components[0][1], z_components[1][1])
-        #l_orthogonal = loss_orthogonality(self.R_s, self.R_m1, self.R_m2)
+        l_orthogonal = loss_orthogonality(self.R_s, self.R_m1, self.R_m2)
         #l_mi = loss_mutual_info(h1, h2, z_components)
-        l_orthogonal = loss_independence(z_components[0][1], z_components[1][1], z_components[0][0], z_components[1][0])
+        l_independence = loss_independence(z_components[0][1], z_components[1][1], z_components[0][0], z_components[1][0])
         #l_mi = loss_mutual_info(h1, h2, z_components, all=False if self.trainable_stage == "shared" else True)
         l_mi = loss_mutual_info(h1, h2, z_components, mode="shared" if self.trainable_stage == "shared" else "all")
         
-        #all_losses = [l_shared.item(), l_orthogonal.item(), l_mi.item()]
-        #all_loss_names = ["Shared Loss", "Orthogonal Loss", "Mutual Info Loss"]
-        all_losses = [l_orthogonal.item(), l_mi.item()]
-        all_loss_names = ["Orthogonal Loss", "Mutual Info Loss"]
+        #all_losses = [l_orthogonal.item(), l_mi.item()]
+        #all_loss_names = ["Orthogonal Loss", "Mutual Info Loss"]
+        all_losses = [l_orthogonal.item(), l_independence.item(), l_mi.item()]
+        all_loss_names = ["Orthogonality Loss", "Independence Loss", "Mutual Info Loss"]
         
         # Return appropriate losses based on stage
         if self.trainable_stage == "shared":
-            #return [l_shared, l_mi], ["Shared Loss", "Mutual Info Loss"], all_losses, all_loss_names
             return [l_mi], ["Mutual Info Loss"], all_losses, all_loss_names
         elif self.trainable_stage == "private":
-            #return [l_orthogonal, l_mi, l_shared], ["Orthogonal Loss", "Mutual Info Loss", "Shared Loss"], all_losses, all_loss_names
-            return [l_orthogonal, l_mi], ["Orthogonal Loss", "Mutual Info Loss"], all_losses, all_loss_names
+            return [l_orthogonal, l_independence, l_mi], ["Orthogonal Loss", "Independence Loss", "Mutual Info Loss"], all_losses, all_loss_names
         elif self.trainable_stage == "joint":
-            #return [l_orthogonal, l_shared, l_mi], ["Orthogonal Loss", "Shared Loss", "Mutual Info Loss"], all_losses, all_loss_names
-            return [l_orthogonal, l_mi], ["Orthogonal Loss", "Mutual Info Loss"], all_losses, all_loss_names
+            return [l_orthogonal, l_independence, l_mi], ["Orthogonal Loss", "Independence Loss", "Mutual Info Loss"], all_losses, all_loss_names
         else:
             raise ValueError(f"Unknown training stage: {self.trainable_stage}")
 
     def evaluate_validation_loss(self, val_dataloader, **kwargs):
         """Evaluate model on validation set."""
         val_total_loss = 0
-        val_loss_list = [0]*2
+        val_loss_list = [0]*3
         #val_loss_list = None
-        loss_balancer = GradientNormalizedLoss(num_losses=2)
+        loss_balancer = GradientNormalizedLoss(num_losses=3)
         self.eval()
         with torch.no_grad():
             for val_batch in val_dataloader:
@@ -339,6 +401,7 @@ class MultiLoReFT(nn.Module):
                 else:
                     val_loss_list[0] += all_losses_list[0]
                     val_loss_list[1] += all_losses_list[1]
+                    val_loss_list[2] += all_losses_list[2]
         self.train() 
         val_loss_list = [loss / len(val_dataloader) for loss in val_loss_list]
         return val_total_loss / len(val_dataloader), val_loss_list
@@ -377,10 +440,10 @@ class MultiLoReFT(nn.Module):
         # Training loop
         shared_mse_loss = 0
         mean_zs = [0,0,0,0]
+        total_val_loss_list = []
         for epoch in range(epochs):
             total_loss = 0
-            #epoch_losses = np.zeros(3)
-            epoch_losses = np.zeros(2)
+            epoch_losses = np.zeros(3)
 
             if self.wandb_log:
                 val_loss, val_logs, val_log_names = evaluate_validation_loss(self, val_dataloader, self.device)
@@ -447,13 +510,16 @@ class MultiLoReFT(nn.Module):
                 
                 losses = torch.stack(losses_list)
                 
-                optimizer.zero_grad()
+                #optimizer.zero_grad()
+                self.optimizer.zero_grad()
                 loss, weights = loss_balancer(losses, trainable_params)
                 # add shared alignment loss
                 shared_mse_loss_batch = F.mse_loss(z_components[0][1], z_components[1][1])
                 #loss += shared_mse_loss_batch
                 loss.backward()
-                optimizer.step()
+                #optimizer.step()
+                self.optimizer.step()
+                self.scheduler.step()
                 
                 total_loss += loss.item()
                 shared_mse_loss += shared_mse_loss_batch.item()
@@ -475,6 +541,7 @@ class MultiLoReFT(nn.Module):
             mean_zs = [mean / len(dataloader) for mean in mean_zs]
             
             val_loss, val_loss_list = self.evaluate_validation_loss(val_dataloader, **kwargs)
+            total_val_loss_list.append(val_loss)
             if self.pruning:
                 # Prune if in joint stage
                 #if self.trainable_stage == "joint" and val_loss_list[-1] <= self.stage_tracking['best_val_MI_loss']*1.05 and epoch>self.stage_switches[-1][-1]+10 and epoch > warmup:
@@ -488,17 +555,21 @@ class MultiLoReFT(nn.Module):
                 self.stage_tracking["min_epochs_counter"] += 1
                 
                 # Calculate improvement
-                #relative_improvement = (self.stage_tracking["best_val_loss"] - val_loss) / self.stage_tracking["best_val_loss"]
-                relative_improvement = (self.stage_tracking["best_val_loss"] - np.mean(val_loss)) / self.stage_tracking["best_val_loss"]
+                #relative_improvement = (self.stage_tracking["best_val_loss"] - np.mean(val_loss)) / self.stage_tracking["best_val_loss"]
+                if len(total_val_loss_list) >= 5:
+                    recent_avg_val_loss = np.mean(total_val_loss_list[-5:])
+                else:
+                    recent_avg_val_loss = np.mean(total_val_loss_list)
+                relative_improvement = (self.stage_tracking["best_val_loss"] - recent_avg_val_loss) / self.stage_tracking["best_val_loss"]
                 
-                #if val_loss<self.stage_tracking["best_val_loss"]:
-                #    self.stage_tracking["best_val_loss"] = val_loss
-                #if val_loss_list[-1] < self.stage_tracking["best_val_MI_loss"]:
+                #if np.mean(val_loss)<self.stage_tracking["best_val_loss"]:
+                #    self.stage_tracking["best_val_loss"] = np.mean(val_loss)
+                if recent_avg_val_loss<self.stage_tracking["best_val_loss"]:
+                    self.stage_tracking["best_val_loss"] = recent_avg_val_loss
+                #if val_loss_list[-1] <self.stage_tracking["best_val_MI_loss"]:
                 #    self.stage_tracking["best_val_MI_loss"] = val_loss_list[-1]
-                if np.mean(val_loss)<self.stage_tracking["best_val_loss"]:
-                    self.stage_tracking["best_val_loss"] = np.mean(val_loss)
-                if val_loss_list[-1] <self.stage_tracking["best_val_MI_loss"]:
-                    self.stage_tracking["best_val_MI_loss"] = val_loss_list[-1]
+                if self.trainable_stage == "joint" and val_loss_list[-1][-1] <self.stage_tracking["best_val_MI_loss"]:
+                    self.stage_tracking["best_val_MI_loss"] = val_loss_list[-1][-1]
                 
                 # Update tracking metrics
                 if relative_improvement > stage_config["min_improvement_ratio"]:
