@@ -186,7 +186,7 @@ class MultiLoReFT(nn.Module):
 
                 # Build new last layer with out_features = k
                 new_last = nn.Linear(in_features, k, bias=True, device=device, dtype=dtype)
-
+                
                 with torch.no_grad():
                     # Rotate rows by Uk^T so that z_new = Uk^T z_old
                     # old W maps h -> z_old in R^{D_old}; we want h -> z_new in R^{k}
@@ -204,19 +204,20 @@ class MultiLoReFT(nn.Module):
             #print(f">>>>>>>>>>>>>>>>>> Pruned %s to %d dimensions "%(name, len(reduced_R)))
             self.stage_tracking["plateau_counter"] = 0
             #return getattr(self, name), keep_indices.sum().item()
-            return reduced_R, k, True
+            return torch.nn.Parameter(reduced_R), k, True
         
         # Prune each matrix
         kept_s, kept_m1, kept_m2 = 0, 0, 0
-        #if len(self.R_s) > 2:
-        #    self.R_s, kept_s = prune_matrix("R_s", self.R_s, [self.W_s0, self.W_s1])
-        #    self.shared_rank = kept_s
-        #if len(self.R_m1) > 2:
-        #    self.R_m1, kept_m1 = prune_matrix("R_m1", self.R_m1, [self.W_m0])
-        #    self.specific_rank = kept_m1
-        #if len(self.R_m2) > 2:
-        #    self.R_m2, kept_m2 = prune_matrix("R_m2", self.R_m2, [self.W_m1])
-        #    self.specific_rank = kept_m2
+        if len(self.R_s) > 2:
+            self.R_s, kept_s, is_pruned = prune_matrix("R_s", self.R_s, [self.W_s0, self.W_s1])
+            self.shared_rank = kept_s
+        if len(self.R_m1) > 2:
+            self.R_m1, kept_m1, is_pruned = prune_matrix("R_m1", self.R_m1, [self.W_m0])
+            self.specific_rank = kept_m1
+        if len(self.R_m2) > 2:
+            self.R_m2, kept_m2, is_pruned = prune_matrix("R_m2", self.R_m2, [self.W_m1])
+            self.specific_rank = kept_m2
+        """
         if self.shared_R_mode == "double":
             pruned_R, kept_s1, is_pruned = prune_matrix("R_s1", self.R_s1, [self.W_s0])
             if is_pruned:
@@ -246,6 +247,9 @@ class MultiLoReFT(nn.Module):
             self.specific_rank = kept_m2
             self.R_m2 = torch.nn.Parameter(pruned_R)
             self.optimizer.param_groups[1]['params'] = [self.R_m1, self.R_m2] + list(self.W_m0.parameters()) + list(self.W_m1.parameters())
+        """
+        if is_pruned:
+            self.optimizer.param_groups[0]['params'] = self.get_trainable_parameters()
         self.optimizer.state = defaultdict(dict, self.optimizer.state)
         
         # print(f"Pruned dimensions: Shared kept {kept_s}, Modality1 kept {kept_m1}, Modality2 kept {kept_m2}")
@@ -340,7 +344,7 @@ class MultiLoReFT(nn.Module):
         #all_losses = [l_orthogonal.item(), l_mi.item()]
         #all_loss_names = ["Orthogonal Loss", "Mutual Info Loss"]
         all_losses = [l_orthogonal.item(), l_independence.item(), l_mi.item()]
-        all_loss_names = ["Orthogonality Loss", "Independence Loss", "Mutual Info Loss"]
+        all_loss_names = ["Orthogonal Loss", "Independence Loss", "Mutual Info Loss"]
         
         # Return appropriate losses based on stage
         if self.trainable_stage == "shared":
@@ -434,8 +438,8 @@ class MultiLoReFT(nn.Module):
         all_epoch_losses = []
         all_epoch_stages = []
         trainable_params = self.get_trainable_parameters()
-        optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=hyperparameters.get('weight_decay', 1e-4))
-        scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
+        self.optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=hyperparameters.get('weight_decay', 1e-4))
+        self.scheduler = self.init_lr_scheduler(self.optimizer, hyperparameters, early_stopping_config, epochs)
         
         # Training loop
         shared_mse_loss = 0
@@ -451,7 +455,7 @@ class MultiLoReFT(nn.Module):
                 log_dict = {
                     "epoch": epoch,
                     "stage": [0 if self.trainable_stage == "shared" else 1 if self.trainable_stage == "private" else 2][0],
-                    "lr": optimizer.param_groups[0]['lr'],
+                    "lr": self.optimizer.param_groups[0]['lr'],
                     "relative_improvement": (self.stage_tracking["best_val_loss"] - val_loss) / self.stage_tracking["best_val_loss"],
                     "shared_MSE": shared_mse_loss,
                     "mean_Zs1": mean_zs[0],
@@ -519,7 +523,7 @@ class MultiLoReFT(nn.Module):
                 loss.backward()
                 #optimizer.step()
                 self.optimizer.step()
-                self.scheduler.step()
+                #self.scheduler.step()
                 
                 total_loss += loss.item()
                 shared_mse_loss += shared_mse_loss_batch.item()
@@ -536,7 +540,7 @@ class MultiLoReFT(nn.Module):
             shared_mse_loss = shared_mse_loss / len(dataloader)
             all_epoch_losses.append(epoch_losses)
             all_epoch_stages.append(self.trainable_stage)
-            scheduler.step()
+            self.scheduler.step()
 
             mean_zs = [mean / len(dataloader) for mean in mean_zs]
             
@@ -547,8 +551,8 @@ class MultiLoReFT(nn.Module):
                 #if self.trainable_stage == "joint" and val_loss_list[-1] <= self.stage_tracking['best_val_MI_loss']*1.05 and epoch>self.stage_switches[-1][-1]+10 and epoch > warmup:
                 if self.trainable_stage == "joint" and (val_loss_list[-1] <= (1.0+self.pruning_threshold)*self.stage_tracking['best_val_MI_loss']) and epoch>self.stage_switches[-1][-1]+warmup:
                     self.prune_singular_values(single=hyperparameters.get("single_prune", False), threshold=self.pruning_value_threshold)
-                    optimizer = self.update_optimizer(optimizer)
-                    scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
+                    #optimizer = self.update_optimizer(optimizer)
+                    #scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
             
             if self.staging:
                 stage_config = early_stopping_config[self.trainable_stage]
@@ -568,8 +572,8 @@ class MultiLoReFT(nn.Module):
                     self.stage_tracking["best_val_loss"] = recent_avg_val_loss
                 #if val_loss_list[-1] <self.stage_tracking["best_val_MI_loss"]:
                 #    self.stage_tracking["best_val_MI_loss"] = val_loss_list[-1]
-                if self.trainable_stage == "joint" and val_loss_list[-1][-1] <self.stage_tracking["best_val_MI_loss"]:
-                    self.stage_tracking["best_val_MI_loss"] = val_loss_list[-1][-1]
+                if self.trainable_stage == "joint" and val_loss_list[-1] <self.stage_tracking["best_val_MI_loss"]:
+                    self.stage_tracking["best_val_MI_loss"] = val_loss_list[-1]
                 
                 # Update tracking metrics
                 if relative_improvement > stage_config["min_improvement_ratio"]:
@@ -608,10 +612,10 @@ class MultiLoReFT(nn.Module):
                     # optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-4)
                     # if in joint stage, reduce the learning rate
                     if self.trainable_stage == "joint":
-                        for param_group in optimizer.param_groups:
+                        for param_group in self.optimizer.param_groups:
                             param_group['lr'] = lr * 0.1
-                    optimizer = self.update_optimizer(optimizer)
-                    scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
+                    #optimizer = self.update_optimizer(optimizer)
+                    #scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
                     self.stage_tracking["best_val_loss"] = 5000
                     self.stage_tracking["plateau_counter"] = 0
                     self.stage_tracking["min_epochs_counter"] = 0
@@ -661,13 +665,13 @@ class MultiLoReFT(nn.Module):
                         print(f"relative_improvement={relative_improvement*100:.2f}%, "
                         f"plateau={self.stage_tracking['plateau_counter']}/{stage_config['patience']}, "
                         f"epochs={self.stage_tracking['min_epochs_counter']}/{stage_config['max_epochs']}")
-            self.save_checkpoint(optimizer, epoch, loss, filepath=save_path)
+            self.save_checkpoint(self.optimizer, epoch, loss, filepath=save_path)
         
         # Plot final losses
         all_epoch_losses = np.array(all_epoch_losses)
         if self.verbose:
             plot_losses(all_epoch_losses, loss_names=all_loss_names, save_path="./plots/%s_loss_curves.pdf"%(exp_name), log_path="./logs/%s_loss_curves.csv"%(exp_name))
-        self.save_checkpoint(optimizer, epoch, loss, filepath=save_path)
+        self.save_checkpoint(self.optimizer, epoch, loss, filepath=save_path)
 
         if self.wandb_log:
             val_loss, val_logs, val_log_names = evaluate_validation_loss(self, val_dataloader, self.device, final=True)
@@ -675,7 +679,7 @@ class MultiLoReFT(nn.Module):
             log_dict = {
                 "epoch": epoch+1,
                 "stage": [0 if self.trainable_stage == "shared" else 1 if self.trainable_stage == "private" else 2][0],
-                "lr": optimizer.param_groups[0]['lr'],
+                "lr": self.optimizer.param_groups[0]['lr'],
                 "relative_improvement": (self.stage_tracking["best_val_loss"] - val_loss) / self.stage_tracking["best_val_loss"],
                 "shared_MSE": shared_mse_loss,
                 "mean_Zs1": mean_zs[0],
