@@ -339,6 +339,8 @@ def loss_orthogonality(R_s, R_m1, R_m2):
 
     # Use mean of squared cosine similarities instead of Frobenius norm directly
     def ortho_pair(A, B):
+        A = A / (A.norm(dim=1, keepdim=True) + 1e-6)
+        B = B / (B.norm(dim=1, keepdim=True) + 1e-6)
         prod = torch.mm(A, B.T)
         return (prod ** 2).mean()
 
