@@ -269,7 +269,8 @@ class MultiLoReFT(nn.Module):
         #l_orthogonal = loss_orthogonality(self.R_s, self.R_m1, self.R_m2)
         #l_mi = loss_mutual_info(h1, h2, z_components)
         l_orthogonal = loss_independence(z_components[0][1], z_components[1][1], z_components[0][0], z_components[1][0])
-        l_mi = loss_mutual_info(h1, h2, z_components, all=False if self.trainable_stage == "shared" else True)
+        #l_mi = loss_mutual_info(h1, h2, z_components, all=False if self.trainable_stage == "shared" else True)
+        l_mi = loss_mutual_info(h1, h2, z_components, mode="shared" if self.trainable_stage == "shared" else "all")
         
         #all_losses = [l_shared.item(), l_orthogonal.item(), l_mi.item()]
         #all_loss_names = ["Shared Loss", "Orthogonal Loss", "Mutual Info Loss"]

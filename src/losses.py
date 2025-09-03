@@ -152,7 +152,7 @@ def loss_mutual_info(h1, h2, z_components, all=True):
     return (loss1 + loss2) / 2
 '''
 
-def loss_mutual_info(h1, h2, z_components, all=True):
+def loss_mutual_info(h1, h2, z_components, mode="all"):
     """
     Maximize mutual information between original and projected representations.
     Supports mismatched dimensions by projecting to a common space.
@@ -169,13 +169,39 @@ def loss_mutual_info(h1, h2, z_components, all=True):
             self.register_buffer('W', W, persistent=False)  # not learnable
         def forward(self, x):
             return x @ self.W  # [B,k]
-    if all:
+    #if all:
     # Concatenate modality-specific and shared components
-        z1 = torch.cat([z_components[0][0], z_components[1][1]], dim=1)
-        z2 = torch.cat([z_components[1][0], z_components[0][1]], dim=1)
-    else:
-        z1 = z_components[1][1]
-        z2 = z_components[0][1]
+    #    z1 = torch.cat([z_components[0][0], z_components[1][1]], dim=1)
+    #    z2 = torch.cat([z_components[1][0], z_components[0][1]], dim=1)
+    #else:
+    #    z1 = z_components[1][1]
+    #    z2 = z_components[0][1]
+
+    class FixedProjector(torch.nn.Module):
+        def __init__(self, d_in, k, ortho=True, seed=0):
+            super().__init__()
+            g = torch.Generator().manual_seed(seed)
+            W = torch.randn(d_in, k, generator=g) / (d_in**0.5)
+            if 0:#ortho:
+                # QR for approximate orthonormal columns
+                Q, _ = torch.linalg.qr(W, mode='reduced')
+                W = Q
+            self.register_buffer('W', W, persistent=False)  # not learnable
+
+        def forward(self, x):
+            return x @ self.W  # [B,k]
+    
+    if mode=="all":
+        rnd = 1#torch.randint(0, 2, (1,)).item()
+        z1 = torch.cat([z_components[rnd][1], z_components[0][0]], dim=1) 
+        z2 = torch.cat([z_components[1-rnd][1], z_components[1][0]], dim=1) 
+    elif mode=="shared":
+        rnd = torch.randint(0, 2, (1,)).item()
+        z1 = z_components[rnd][1]
+        z2 = z_components[1-rnd][1]
+    elif mode=="private":
+        z1 = z_components[1][0]
+        z2 = z_components[0][0]
     # Handle dimension mismatch
     if h1.shape[1] != z1.shape[1]:
         proj_dim = max(h1.shape[1], z1.shape[1])
