@@ -290,7 +290,7 @@ def evaluate_classification(z_n, labels):
         z_n: Tuple of (modality_specific, shared) representations for each modality
         labels: Target labels for binary classification
     """
-    #print(f'Classification predictability')
+    print(f'Classification predictability')
     components = [
         ("Zs1", z_n[0][1]),  # Shared representation from modality 1
         ("Zs2", z_n[1][1]),  # Shared representation from modality 2
@@ -308,27 +308,48 @@ def evaluate_classification(z_n, labels):
         z_np = z.detach().cpu().numpy()
         y_np = labels.astype(int)
         
-        # Check if binary classification
+        # Check number of classes
         unique_classes = np.unique(y_np)
-        if len(unique_classes) != 2:
-            print(f"Warning: Expected binary classification but found {len(unique_classes)} classes. Skipping {name}.")
+        n_classes = len(unique_classes)
+        
+        if n_classes < 2:
+            print(f"Warning: Found only {n_classes} class. Skipping {name}.")
             continue
-            
+        
         # Initialize classifier with balanced class weights for robustness
+        # Use different solvers based on number of classes
+        if n_classes == 2:
+            solver = 'liblinear'  # Works well for binary classification
+        else:
+            solver = 'lbfgs'  # Better for multi-class classification
+            
         model = LogisticRegression(
             max_iter=1000, 
             class_weight='balanced',
-            solver='liblinear',  # Works well for small datasets
+            solver=solver,
             random_state=0
         )
         
-        scoring = {
-            'accuracy': make_scorer(accuracy_score),
-            'precision': make_scorer(precision_score),
-            'recall': make_scorer(recall_score),
-            'f1': make_scorer(f1_score),
-            'roc_auc': make_scorer(roc_auc_score)
-        }
+        # Define scoring metrics based on number of classes
+        if n_classes == 2:
+            # Binary classification - use all metrics
+            scoring = {
+                'accuracy': make_scorer(accuracy_score),
+                'precision': make_scorer(precision_score, zero_division=0),
+                'recall': make_scorer(recall_score, zero_division=0),
+                'f1': make_scorer(f1_score, zero_division=0),
+                'roc_auc': make_scorer(roc_auc_score, needs_proba=True)
+            }
+        else:
+            # Multi-class classification - use metrics that support multi-class
+            # For ROC AUC in multi-class, we need probability predictions
+            scoring = {
+                'accuracy': make_scorer(accuracy_score),
+                'precision': make_scorer(precision_score, average='weighted', zero_division=0),
+                'recall': make_scorer(recall_score, average='weighted', zero_division=0),
+                'f1': make_scorer(f1_score, average='weighted', zero_division=0),
+                'roc_auc': make_scorer(roc_auc_score, multi_class='ovr', average='weighted', needs_proba=True)
+            }
         
         cv_results = cross_validate(
             model, z_np, y_np, 
@@ -338,11 +359,11 @@ def evaluate_classification(z_n, labels):
         )
         
         # Print results
-        #print(f"{name} -----Accuracy:  {cv_results['test_accuracy'].mean():.3f} ± {cv_results['test_accuracy'].std():.3f}",
-        #      f"  Precision: {cv_results['test_precision'].mean():.3f} ± {cv_results['test_precision'].std():.3f}",
-        #      f"  Recall:    {cv_results['test_recall'].mean():.3f} ± {cv_results['test_recall'].std():.3f}",
-        #      f"  F1 Score:  {cv_results['test_f1'].mean():.3f} ± {cv_results['test_f1'].std():.3f}",
-        #      f"  ROC AUC:   {cv_results['test_roc_auc'].mean():.3f} ± {cv_results['test_roc_auc'].std():.3f}")
+        #print(f"{name} ({n_classes} classes) -----Accuracy:  {cv_results['test_accuracy'].mean():.3f} ± {cv_results['test_accuracy'].std():.3f}",
+        #    f"  Precision: {cv_results['test_precision'].mean():.3f} ± {cv_results['test_precision'].std():.3f}",
+        #    f"  Recall:    {cv_results['test_recall'].mean():.3f} ± {cv_results['test_recall'].std():.3f}",
+        #    f"  F1 Score:  {cv_results['test_f1'].mean():.3f} ± {cv_results['test_f1'].std():.3f}",
+        #    f"  ROC AUC:   {cv_results['test_roc_auc'].mean():.3f} ± {cv_results['test_roc_auc'].std():.3f}")
         class_df = pd.concat([class_df, pd.DataFrame({
             "name": [name],
             "accuracy": [cv_results['test_accuracy'].mean()],
