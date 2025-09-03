@@ -471,8 +471,7 @@ def loss_independence(z_s1, z_s2, z_m1, z_m2):
     """
     Compute independence loss between shared and modality-specific representations.
     """
-    #return hsic_rbf(z_s1, z_m1) + hsic_rbf(z_s2, z_m2)+ hsic_rbf(z_m1, z_m2)
-    return hsic_rbf(z_s1, z_m1, unbiased=False) + hsic_rbf(z_s2, z_m2, unbiased=False)+ hsic_rbf(z_m1, z_m2, unbiased=False)
+    return hsic_rbf(z_s1, z_m1, unbiased=True) + hsic_rbf(z_s2, z_m2, unbiased=True) + hsic_rbf(z_m1, z_m2, unbiased=True)
 
 
 def center_gram(gram):
