@@ -35,7 +35,8 @@ class MultiLoReFT(nn.Module):
         super(MultiLoReFT, self).__init__()
         self.shared_rank = shared_rank
         self.specific_rank = specific_rank
-        self.pruning_threshold = pruning_threshold
+        #self.pruning_threshold = pruning_threshold
+        self.pruning_threshold = pruning_value_threshold
         self.pruning_value_threshold = pruning_value_threshold
         self.pruned = False
         self.dataset_name = dataset_name
@@ -137,6 +138,7 @@ class MultiLoReFT(nn.Module):
             #if len(S) < 2:
             #    return R, len(S)
             if R.shape[0] < 3:
+                #print(f"Skipping pruning for {name} with shape {R.shape}")
                 return R, R.shape[0], False
             U, S, Vh = torch.linalg.svd(R, full_matrices=False)
             
@@ -145,6 +147,7 @@ class MultiLoReFT(nn.Module):
                 min_sv_idx = torch.argmin(S)
                 min_sv = S[min_sv_idx]
                 if min_sv > self.pruning_threshold:
+                    #print(f"Skipping pruning for {name} with min singular value {min_sv:.4f} above threshold {self.pruning_threshold}")
                     return R, len(S), False
                 
                 n_remove = 1
@@ -157,6 +160,7 @@ class MultiLoReFT(nn.Module):
                 below_threshold = S < self.pruning_threshold
                 num_below = below_threshold.sum().item()
                 if num_below == 0:
+                    #print(f"Skipping pruning for {name} with all singular values above threshold {self.pruning_threshold}")
                     return R, len(S), False
                 # Calculate number to remove (between 1-10% of matrix size)
                 n_remove = max(1, min(num_below, int(threshold * len(S))))
@@ -251,6 +255,11 @@ class MultiLoReFT(nn.Module):
         if is_pruned:
             self.optimizer.param_groups[0]['params'] = self.get_trainable_parameters()
         self.optimizer.state = defaultdict(dict, self.optimizer.state)
+
+        #if is_pruned:
+        #    print(f"Pruned projection matrices to: R_s {kept_s}, R_m1 {kept_m1}, R_m2 {kept_m2}")
+        #else:
+        #    print(f"No pruning performed.")
         
         # print(f"Pruned dimensions: Shared kept {kept_s}, Modality1 kept {kept_m1}, Modality2 kept {kept_m2}")
          
@@ -434,10 +443,11 @@ class MultiLoReFT(nn.Module):
             print(f"Training on device: {self.device}")
             print(f"Model is on device: {next(self.parameters()).device}")
         # Initialize loss tracking
-        loss_balancer = GradientNormalizedLoss(num_losses=2)
+        loss_balancer = GradientNormalizedLoss(num_losses=3)
         all_epoch_losses = []
         all_epoch_stages = []
         trainable_params = self.get_trainable_parameters()
+        # print trainable parameters with names
         self.optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=hyperparameters.get('weight_decay', 1e-4))
         self.scheduler = self.init_lr_scheduler(self.optimizer, hyperparameters, early_stopping_config, epochs)
         
@@ -521,6 +531,11 @@ class MultiLoReFT(nn.Module):
                 shared_mse_loss_batch = F.mse_loss(z_components[0][1], z_components[1][1])
                 #loss += shared_mse_loss_batch
                 loss.backward()
+                # print all the gradients with name for the parameters
+                #for name, param in self.named_parameters():
+                #    if param.grad is not None:
+                #        print(f"Gradient for {name}: {param.grad.norm().item()}")
+                #exit()
                 #optimizer.step()
                 self.optimizer.step()
                 #self.scheduler.step()
@@ -614,6 +629,7 @@ class MultiLoReFT(nn.Module):
                     if self.trainable_stage == "joint":
                         for param_group in self.optimizer.param_groups:
                             param_group['lr'] = lr * 0.1
+                    self.optimizer.param_groups[0]['params'] = self.get_trainable_parameters()
                     #optimizer = self.update_optimizer(optimizer)
                     #scheduler = self.init_lr_scheduler(optimizer, hyperparameters, early_stopping_config, epochs)
                     self.stage_tracking["best_val_loss"] = 5000
@@ -698,7 +714,7 @@ class MultiLoReFT(nn.Module):
                 for i, loss_name in enumerate(all_loss_names):
                     log_dict[loss_name] = all_epoch_losses[-1][i]
             log_wandb(log_dict)
-            return all_epoch_losses, all_loss_names, all_epoch_stages
+        return all_epoch_losses, all_loss_names, all_epoch_stages
 
 
     def save_checkpoint(self, optimizer, epoch, loss, filepath):
