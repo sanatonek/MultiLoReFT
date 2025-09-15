@@ -206,21 +206,22 @@ def loss_mutual_info(h1, h2, z_components, mode="all"):
     if h1.shape[1] != z1.shape[1]:
         #proj_dim = max(h1.shape[1], z1.shape[1])
         proj_dim = min(h1.shape[1], z1.shape[1])
-        if h1.shape[1] < proj_dim:
+        if h1.shape[1] > proj_dim:
             # padding = torch.zeros(h1.size(0), proj_dim - h1.shape[1], device=h1.device)
             # h1 = torch.cat((h1, padding), dim=1)
             h1 = FixedProjector(h1.shape[1], k=proj_dim, seed=123).to(h1.device)(h1)
-        if z1.shape[1] < proj_dim:
+        if z1.shape[1] > proj_dim:
             # padding = torch.zeros(z1.size(0), proj_dim - z1.shape[1], device=z1.device)
             # z1 = torch.cat((z1, padding), dim=1)
             z1 = FixedProjector(z1.shape[1], k=proj_dim, seed=223).to(z1.device)(z1)
     if h2.shape[1] != z2.shape[1]:
-        proj_dim = max(h2.shape[1], z2.shape[1])
-        if h2.shape[1] < proj_dim:
+        #proj_dim = max(h2.shape[1], z2.shape[1])
+        proj_dim = min(h2.shape[1], z2.shape[1])
+        if h2.shape[1] > proj_dim:
             # padding = torch.zeros(h2.size(0), proj_dim - h2.shape[1], device=h2.device)
             # h2 = torch.cat((h2, padding), dim=1)
             h2 = FixedProjector(h2.shape[1], k=proj_dim, seed=124).to(h2.device)(h2)
-        if z2.shape[1] < proj_dim:
+        if z2.shape[1] > proj_dim:
             # padding = torch.zeros(z2.size(0), proj_dim - z2.shape[1], device=z2.device)
             # z2 = torch.cat((z2, padding), dim=1)
             z2 = FixedProjector(z2.shape[1], k=proj_dim, seed=224).to(z2.device)(z2)
