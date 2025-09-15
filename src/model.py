@@ -341,7 +341,7 @@ class MultiLoReFT(nn.Module):
         random_zs = zs1 if torch.randint(0, 2, (1,)).item() == 0 else zs2
         return torch.cat((zm1, zm2, random_zs), dim=-1)
 
-    def compute_stage_losses(self, h1, h2, z_components):
+    def compute_stage_losses(self, h1, h2, z_components, ignore_loss=None):
         # Compute all losses
         #l_shared = loss_shared_consistency(z_components[0][1], z_components[1][1])
         l_orthogonal = loss_orthogonality(self.R_s, self.R_m1, self.R_m2)
@@ -350,20 +350,31 @@ class MultiLoReFT(nn.Module):
         #l_mi = loss_mutual_info(h1, h2, z_components, all=False if self.trainable_stage == "shared" else True)
         l_mi = loss_mutual_info(h1, h2, z_components, mode="shared" if self.trainable_stage == "shared" else "all")
         
-        #all_losses = [l_orthogonal.item(), l_mi.item()]
-        #all_loss_names = ["Orthogonal Loss", "Mutual Info Loss"]
         all_losses = [l_orthogonal.item(), l_independence.item(), l_mi.item()]
         all_loss_names = ["Orthogonal Loss", "Independence Loss", "Mutual Info Loss"]
-        
-        # Return appropriate losses based on stage
+        loss_objs = [l_orthogonal, l_independence, l_mi]
+        loss_keys = ["orthogonal_loss", "independence_loss", "mutual_info_loss"]
+        # Stage-specific selection
         if self.trainable_stage == "shared":
-            return [l_mi], ["Mutual Info Loss"], all_losses, all_loss_names
+            idxs = [2]  # Only MI loss
         elif self.trainable_stage == "private":
-            return [l_orthogonal, l_independence, l_mi], ["Orthogonal Loss", "Independence Loss", "Mutual Info Loss"], all_losses, all_loss_names
+            idxs = [0, 1, 2]  # All three
         elif self.trainable_stage == "joint":
-            return [l_orthogonal, l_independence, l_mi], ["Orthogonal Loss", "Independence Loss", "Mutual Info Loss"], all_losses, all_loss_names
+            idxs = [0, 1, 2]  # All three
         else:
             raise ValueError(f"Unknown training stage: {self.trainable_stage}")
+        stage_loss_objs = [loss_objs[i] for i in idxs]
+        stage_loss_names = [all_loss_names[i] for i in idxs]
+        stage_loss_vals = [all_losses[i] for i in idxs]
+        stage_loss_keys = [loss_keys[i] for i in idxs]
+        # Filter by ignore_loss
+        if ignore_loss is not None:
+            filtered = [(obj, name, val, key) for obj, name, val, key in zip(stage_loss_objs, stage_loss_names, stage_loss_vals, stage_loss_keys) if key not in ignore_loss]
+            if not filtered:
+                raise ValueError("All losses removed by ignore_loss; nothing to optimize.")
+            filtered_objs, filtered_names, filtered_vals, filtered_keys = zip(*filtered)
+            return list(filtered_objs), list(filtered_names), list(filtered_vals), list(filtered_names)
+        return stage_loss_objs, stage_loss_names, stage_loss_vals, stage_loss_names
 
     def evaluate_validation_loss(self, val_dataloader, **kwargs):
         """Evaluate model on validation set."""
@@ -443,7 +454,13 @@ class MultiLoReFT(nn.Module):
             print(f"Training on device: {self.device}")
             print(f"Model is on device: {next(self.parameters()).device}")
         # Initialize loss tracking
-        loss_balancer = GradientNormalizedLoss(num_losses=3)
+        # Select loss balancer based on ablation
+        grad_norm = hyperparameters.get('grad_normalizer', True) if hyperparameters else True
+        ignore_loss = hyperparameters.get('ignore_loss', None) if hyperparameters else None
+        if grad_norm:
+            loss_balancer = GradientNormalizedLoss(num_losses=3 if ignore_loss is None else 3-len(ignore_loss))
+        else:
+            loss_balancer = None
         all_epoch_losses = []
         all_epoch_stages = []
         trainable_params = self.get_trainable_parameters()
@@ -520,29 +537,20 @@ class MultiLoReFT(nn.Module):
                 
                 z_components = self.decouple(phis, full=True)
                 #z_components = self.decouple([h1, h2], full=True)
-                losses_list, loss_names, all_losses, all_loss_names = self.compute_stage_losses(h1, h2, z_components)
-                
+                losses_list, loss_names, all_losses, all_loss_names = self.compute_stage_losses(h1, h2, z_components, ignore_loss=ignore_loss)
                 losses = torch.stack(losses_list)
-                
-                #optimizer.zero_grad()
                 self.optimizer.zero_grad()
-                loss, weights = loss_balancer(losses, trainable_params)
-                # add shared alignment loss
+                if grad_norm:
+                    loss, weights = loss_balancer(losses, trainable_params)
+                else:
+                    loss = losses.sum()
+                    weights = None
                 shared_mse_loss_batch = F.mse_loss(z_components[0][1], z_components[1][1])
-                #loss += shared_mse_loss_batch
                 loss.backward()
-                # print all the gradients with name for the parameters
-                #for name, param in self.named_parameters():
-                #    if param.grad is not None:
-                #        print(f"Gradient for {name}: {param.grad.norm().item()}")
-                #exit()
-                #optimizer.step()
                 self.optimizer.step()
-                #self.scheduler.step()
-                
                 total_loss += loss.item()
                 shared_mse_loss += shared_mse_loss_batch.item()
-                epoch_losses += all_losses
+                epoch_losses += np.array([l.item() for l in losses_list])
 
                 # observe mean Z values to check collapse
                 mean_zs[0] += torch.mean(z_components[0][1]).item()
