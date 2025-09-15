@@ -204,7 +204,8 @@ def loss_mutual_info(h1, h2, z_components, mode="all"):
         z2 = z_components[0][0]
     # Handle dimension mismatch
     if h1.shape[1] != z1.shape[1]:
-        proj_dim = max(h1.shape[1], z1.shape[1])
+        #proj_dim = max(h1.shape[1], z1.shape[1])
+        proj_dim = min(h1.shape[1], z1.shape[1])
         if h1.shape[1] < proj_dim:
             # padding = torch.zeros(h1.size(0), proj_dim - h1.shape[1], device=h1.device)
             # h1 = torch.cat((h1, padding), dim=1)
