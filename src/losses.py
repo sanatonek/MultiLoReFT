@@ -1,7 +1,6 @@
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 
 class AdaptiveLossWeights(nn.Module):
@@ -52,7 +51,6 @@ class GradientNormalizedLoss:
             # Compute gradients for each loss
             grads = []
             for loss in losses:
-            #     model.zero_grad()
                 loss.backward(retain_graph=True)
                 
                 # Collect gradients for trainable parameters
@@ -78,11 +76,56 @@ class GradientNormalizedLoss:
         weighted_loss = sum(w * l for w, l in zip(weights, losses))
         return weighted_loss, weights
 
-def loss_reconstruction(h, x, decoder):
-    """Compute reconstruction loss between input and decoded representation."""
-    return F.l1_loss(x, decoder(h))
+def _pad_or_trunc_right(z: torch.Tensor, target_dim: int) -> torch.Tensor:
+    # Expect z: (B, D) (or will auto-fix common cases)
+    if z.dim() == 1:
+        z = z.unsqueeze(0)  # (1, D)
+    elif z.dim() > 2:
+        z = z.view(z.size(0), -1)  # flatten trailing dims
 
-def loss_mutual_info(h1, h2, z_components, mode="all"):
+    cur = z.size(-1)
+    if cur == target_dim:
+        return z
+    if cur > target_dim:
+        return z[..., :target_dim]  # truncate on the right
+    # pad on the right
+    pad = target_dim - cur
+    return F.pad(z, (0, pad), mode="constant", value=0.0)
+
+def _pad_right_to(x: torch.Tensor, target_dim: int) -> torch.Tensor:
+    # x: [B, D]
+    if x.dim() == 1:
+        x = x.unsqueeze(0)
+    elif x.dim() > 2:
+        x = x.view(x.size(0), -1)
+    d = x.size(-1)
+    if d >= target_dim:
+        return x  # NO truncation
+    return F.pad(x, (0, target_dim - d), mode="constant", value=0.0)
+
+def loss_reconstruction(h1, h2, z_components, decoders, mode):
+    """Compute reconstruction loss between input and decoded representation."""
+    if mode == "joint":
+        rnd = 1
+        z1 = torch.cat([z_components[rnd][1], z_components[0][0]], dim=1)
+        z2 = torch.cat([z_components[1-rnd][1], z_components[1][0]], dim=1)
+    elif mode == "shared":
+        rnd = torch.randint(0, 2, (1,)).item()
+        z1 = z_components[rnd][1]
+        z2 = z_components[1-rnd][1]
+    if mode == "private":
+        z1 = torch.cat([z_components[0][1], z_components[0][0]], dim=1)
+        z2 = torch.cat([z_components[1][1], z_components[1][0]], dim=1) 
+    z1 = _pad_or_trunc_right(z1, h1.shape[1]).to(device=h1.device, dtype=h1.dtype)
+    z2 = _pad_or_trunc_right(z2, h2.shape[1]).to(device=h2.device, dtype=h2.dtype)
+
+    z1 = F.normalize(z1, p=2, dim=1)
+    z2 = F.normalize(z2, p=2, dim=1)
+    l1 = F.mse_loss(h1, decoders[0](z1))
+    l2 = F.mse_loss(h2, decoders[1](z2))
+    return (l1 + l2) / 2
+
+def loss_mutual_info(h1, h2, z_components, mode="joint"):
     """
     Maximize mutual information between original and projected representations.
     Supports mismatched dimensions by projecting to a common space.
@@ -92,48 +135,38 @@ def loss_mutual_info(h1, h2, z_components, mode="all"):
             super().__init__()
             g = torch.Generator().manual_seed(seed)
             W = torch.randn(d_in, k, generator=g) / (d_in**0.5)
-            if 0:#ortho:
-                # QR for approximate orthonormal columns
+            if ortho:
                 Q, _ = torch.linalg.qr(W, mode='reduced')
                 W = Q
-            self.register_buffer('W', W, persistent=False)  # not learnable
+            self.register_buffer('W', W, persistent=False)
 
         def forward(self, x):
-            return x @ self.W  # [B,k]
+            return x @ self.W
 
-    if mode=="all":
-    # Concatenate modality-specific and shared components
-        rnd = 1#torch.randint(0, 2, (1,)).item()
-        z1 = torch.cat([z_components[rnd][1], z_components[0][0]], dim=1) 
-        z2 = torch.cat([z_components[1-rnd][1], z_components[1][0]], dim=1) 
-    elif mode=="shared":
+    if mode == "joint":
+        rnd = 1
+        z1 = torch.cat([z_components[rnd][1], z_components[0][0]], dim=1)
+        z2 = torch.cat([z_components[1-rnd][1], z_components[1][0]], dim=1)
+    elif mode == "shared":
         rnd = torch.randint(0, 2, (1,)).item()
         z1 = z_components[rnd][1]
         z2 = z_components[1-rnd][1]
-    elif mode=="private":
-        z1 = z_components[1][0]
-        z2 = z_components[0][0]
-    
+    if mode == "private":
+        z1 = torch.cat([z_components[0][1], z_components[0][0]], dim=1)
+        z2 = torch.cat([z_components[1][1], z_components[1][0]], dim=1) 
+
     # Handle dimension mismatch
     if h1.shape[1] != z1.shape[1]:
-        proj_dim = max(h1.shape[1], z1.shape[1])
-        if h1.shape[1] < proj_dim:
-            # padding = torch.zeros(h1.size(0), proj_dim - h1.shape[1], device=h1.device)
-            # h1 = torch.cat((h1, padding), dim=1)
+        proj_dim = min(h1.shape[1], z1.shape[1])
+        if h1.shape[1] > proj_dim:
             h1 = FixedProjector(h1.shape[1], k=proj_dim, seed=123).to(h1.device)(h1)
-        if z1.shape[1] < proj_dim:
-            # padding = torch.zeros(z1.size(0), proj_dim - z1.shape[1], device=z1.device)
-            # z1 = torch.cat((z1, padding), dim=1)
+        if z1.shape[1] > proj_dim:
             z1 = FixedProjector(z1.shape[1], k=proj_dim, seed=223).to(z1.device)(z1)
     if h2.shape[1] != z2.shape[1]:
-        proj_dim = max(h2.shape[1], z2.shape[1])
-        if h2.shape[1] < proj_dim:
-            # padding = torch.zeros(h2.size(0), proj_dim - h2.shape[1], device=h2.device)
-            # h2 = torch.cat((h2, padding), dim=1)
+        proj_dim = min(h2.shape[1], z2.shape[1])
+        if h2.shape[1] > proj_dim:
             h2 = FixedProjector(h2.shape[1], k=proj_dim, seed=124).to(h2.device)(h2)
-        if z2.shape[1] < proj_dim:
-            # padding = torch.zeros(z2.size(0), proj_dim - z2.shape[1], device=z2.device)
-            # z2 = torch.cat((z2, padding), dim=1)
+        if z2.shape[1] > proj_dim:
             z2 = FixedProjector(z2.shape[1], k=proj_dim, seed=224).to(z2.device)(z2)
     
     # Normalize representations
@@ -141,16 +174,13 @@ def loss_mutual_info(h1, h2, z_components, mode="all"):
     h2 = F.normalize(h2, dim=1)
     z1 = F.normalize(z1, dim=1)
     z2 = F.normalize(z2, dim=1)
-    # Compute InfoNCE-style similarity
-    temp = 0.1
-    # logits1 = torch.mm(h1, z1.T) / temp
-    # logits2 = torch.mm(h2, z2.T) / temp
-    logits1 = (h1 @ z1.T) / 0.1
-    logits2 = (h2 @ z2.T) / 0.1
+    temp = 0.01
+    labels = torch.arange(h1.size(0), device=h1.device)
+    logits1 = (h1 @ z1.T) / temp
+    logits2 = (h2 @ z2.T) / temp
     
-    # Compute InfoNCE losses
-    loss1 = -torch.mean(torch.diagonal(logits1) - torch.logsumexp(logits1, dim=1))
-    loss2 = -torch.mean(torch.diagonal(logits2) - torch.logsumexp(logits2, dim=1))
+    loss1 = F.cross_entropy(logits1, labels)
+    loss2 = F.cross_entropy(logits2, labels)
     return (loss1 + loss2) / 2
 
 def loss_invariance_m(phi1, phi2, model):
@@ -239,18 +269,6 @@ def loss_orthogonality(R_s, R_m1, R_m2):
     """
     Ensure orthogonality between shared and modality-specific spaces.
     """
-    # loss_ortho_1 = torch.norm(torch.mm(R_s, R_m1.T), p="fro")**2/ R_s.numel()
-    # loss_ortho_2 = torch.norm(torch.mm(R_m1, R_m2.T), p="fro")**2/ R_m1.numel()
-    # loss_ortho_3 = torch.norm(torch.mm(R_s, R_m2.T), p="fro")**2/ R_s.numel()
-    # return loss_ortho_1 + loss_ortho_2 + loss_ortho_3
-    # def safe_normalize(x):
-    #     return x / (x.norm(dim=-1, keepdim=True) + 1e-8)
-
-    # R_s = safe_normalize(R_s)
-    # R_m1 = safe_normalize(R_m1)
-    # R_m2 = safe_normalize(R_m2)
-
-    # Use mean of squared cosine similarities instead of Frobenius norm directly
     def ortho_pair(A, B):
         A = A / (A.norm(dim=1, keepdim=True) + 1e-6)
         B = B / (B.norm(dim=1, keepdim=True) + 1e-6)
@@ -261,19 +279,12 @@ def loss_orthogonality(R_s, R_m1, R_m2):
     loss_ortho_2 = ortho_pair(R_m1, R_m2)
     loss_ortho_3 = ortho_pair(R_s, R_m2)
 
-    return (loss_ortho_1 + loss_ortho_3 + loss_ortho_3)
+    return (loss_ortho_1 + loss_ortho_2 + loss_ortho_3)
 
 def loss_shared_consistency(z_s1, z_s2):
     """
     Ensure consistency between shared representations of different modalities.
     """
-    # Normalize each representation
-    # z_s1_norm = F.normalize(z_s1, p=2, dim=1)
-    # z_s2_norm = F.normalize(z_s2, p=2, dim=1)
-    
-    # # Compute MSE between normalized representations
-    # return F.mse_loss(z_s1_norm, z_s2_norm)
-    
     # Center representations
     z_s1_centered = z_s1 - z_s1.mean(dim=0, keepdim=True)
     z_s2_centered = z_s2 - z_s2.mean(dim=0, keepdim=True)
@@ -289,9 +300,6 @@ def loss_shared_consistency(z_s1, z_s2):
     
     # Return negative correlation to minimize
     return -torch.mean(torch.diagonal(corr))
-    # return 1 - linear_cka(z_s1, z_s2)
-    # cos_similarity = 1 - F.cosine_similarity(z_s1, z_s2, dim=1)
-    # return torch.mean(cos_similarity)
 
 def rbf_kernel(x, sigma=None, eps=1e-12, return_sigma=True):
     x_norm = (x ** 2).sum(dim=1, keepdim=True)
@@ -371,8 +379,7 @@ def loss_independence(z_s1, z_s2, z_m1, z_m2, mod):
     """
     Compute independence loss between shared and modality-specific representations.
     """
-    # return hsic_linear(z_s1, z_m1, unbiased=False) + hsic_linear(z_s2, z_m2, unbiased=False) + hsic_linear(z_m1, z_m2, unbiased=False) #+ hsic_rbf(z_s2, z_m1, unbiased=False)#+ hsic_rbf(z_m1, z_m2, unbiased=False)
-    return hsic_rbf(z_s1, z_m1, unbiased=True) + hsic_rbf(z_s2, z_m2, unbiased=True) + hsic_rbf(z_m1, z_m2, unbiased=True) #+ hsic_rbf(z_s2, z_m1, unbiased=True) + hsic_rbf(z_m2, z_s1, unbiased=True)
+    return hsic_rbf(z_s1, z_m1, unbiased=True) + hsic_rbf(z_s2, z_m2, unbiased=True) + hsic_rbf(z_m1, z_m2, unbiased=True)
 
 
 def center_gram(gram):

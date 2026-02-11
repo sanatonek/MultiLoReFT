@@ -10,6 +10,9 @@ from sklearn.cluster import KMeans
 import torchvision.transforms as transforms
 from skorch import NeuralNetRegressor
 from sklearn.linear_model import LinearRegression, Lasso, LogisticRegression
+from sklearn.multioutput import MultiOutputClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import make_pipeline
 
 
 import matplotlib.pyplot as plt
@@ -100,13 +103,15 @@ def load_checkpoint(filepath, model, optimizer=None):
 
     if optimizer:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    
+    model.eval()
 
     print(f"Checkpoint loaded from {filepath} (Epoch {checkpoint['epoch']})")
     return model
 
 
 class SklearnTrainer:
-    def __init__(self, model, task_type="regression"):
+    def __init__(self,  task_type="regression"):
         """
         Wrapper for training a Scikit-Learn model with k-fold cross-validation.
 
@@ -114,10 +119,9 @@ class SklearnTrainer:
             model: A Scikit-Learn model instance.
             task_type (str): "regression", "binary", or "multiclass".
         """
-        self.model = model
         self.task_type = task_type
 
-    def train_and_evaluate(self, X, y, k=5):
+    def train_and_evaluate(self, X, y, k=5, z_test=None, y_test=None):
         """
         Trains and evaluates the model using k-fold cross-validation.
 
@@ -131,11 +135,21 @@ class SklearnTrainer:
         """
         kf = KFold(n_splits=k, shuffle=True, random_state=42)
         all_scores = []
+        all_score_1 = []
         score_1 = None
+        for i in range(5 if z_test is None else 1):
+            # Randomly split the data into 80% train and 20% validation
+            indices = np.arange(X.shape[0])
+            np.random.shuffle(indices)
+            split_idx = int(0.8 * len(indices))
+            train_idx, val_idx = indices[:split_idx], indices[split_idx:]
 
-        for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
-            X_train, X_val = X[train_idx], X[val_idx]
-            y_train, y_val = y[train_idx], y[val_idx]
+            if z_test is None:
+                X_train, X_val = X[train_idx], X[val_idx]
+                y_train, y_val = y[train_idx], y[val_idx] 
+            else:
+                X_train, X_val = X, np.array(z_test).reshape(-1, z_test.shape[1])
+                y_train, y_val = y, np.array(y_test).reshape(-1, 1)
             if y_train.ndim > 1 and y_train.shape[1] == 1:
                 y_train = y_train.ravel()
             if y_val.ndim > 1 and y_val.shape[1] == 1:
@@ -165,38 +179,40 @@ class SklearnTrainer:
                 score = mean_squared_error(y_val, y_pred)
 
             elif self.task_type == "binary":
-                self.model = Lasso(alpha=0.1)
+                self.model = LogisticRegression(
+                                    max_iter=5000,
+                                    random_state=42*i,
+                                    solver="liblinear",
+                                    penalty="l2",
+                                    C= 0.0001,
+                                    class_weight="balanced", # remove if classes are already balanced
+                                )
                 self.model.fit(X_train, y_train)
-                # Binary classification: use probabilities if available
-                if hasattr(self.model, "predict_proba"):
-                    y_pred = self.model.predict_proba(X_val)[:, 1]
-                else:
-                    y_pred = self.model.predict(X_val)
-                score = roc_auc_score(y_val, y_pred)
+                y_pred = self.model.predict(X_val)
+                print(accuracy_score(self.model.predict(X_train), y_train), accuracy_score(y_pred, y_val))
+                score = accuracy_score(y_pred, y_val)
                 kmeans = KMeans(n_clusters=np.unique(y_val).shape[0], random_state=42)
                 score_1 = silhouette_score(X_val, kmeans.fit_predict(X_val))
 
-
             elif self.task_type == "multiclass":
-                self.model = LogisticRegression(max_iter=1000, solver='lbfgs')
+                # Convert labels to one-hot encoding
+                # unique_train_labels = np.unique(y_train)
+                self.model = LogisticRegression(max_iter=5000, random_state=42)#, multi_class="multinomial")
                 self.model.fit(X_train, y_train)
-                if hasattr(self.model, "predict_proba"):
-                    y_pred = self.model.predict_proba(X_val)
-                    score = roc_auc_score(y_val, y_pred, multi_class='ovr', average='macro')
-                    kmeans = KMeans(n_clusters=np.unique(y_val).shape[0], random_state=42)
-                    score_1 = silhouette_score(X_val, kmeans.fit_predict(X_val))
-                else:
-                    y_pred = self.model.predict(X_val)
-                    score = accuracy_score(y_val, y_pred)
+                y_pred = self.model.predict(X_val)
+                score = accuracy_score(y_val, y_pred)
+                kmeans = KMeans(n_clusters=len(self.model.classes_), random_state=42)
+                score_1 = silhouette_score(X_val, kmeans.fit_predict(X_val))
 
             else:
                 raise ValueError(f"Unsupported task type: {self.task_type}")
 
             all_scores.append(score)
+            all_score_1.append(score_1)
         if score_1 is not None:
-            return np.mean(all_scores), np.var(all_scores), np.mean(score_1), np.var(score_1)
+            return all_scores, all_score_1
         else:
-            return np.mean(all_scores), np.var(all_scores)
+            return all_scores
     
 def plot_losses(losses, loss_names, save_path=None, log_path=None, stage_switches=None):
     """Plot loss curves in separate horizontal subplots and save loss values."""

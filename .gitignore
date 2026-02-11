@@ -1,0 +1,29 @@
+# Data and artifacts (do not push)
+data/
+checkpoints/
+ckpts/
+drim_ckpts/
+plots/
+logs/
+wandb/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/

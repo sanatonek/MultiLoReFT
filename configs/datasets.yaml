@@ -1,0 +1,113 @@
+# Dataset configurations for evaluate_representations and baselines
+# All paths are relative to project root
+
+simulated:
+  data_path: "./data/simplest_sim_nongaussian.npz"
+  task_names:
+    - shared
+    - m1
+    - m2
+    - joint
+  modality_names:
+    - "I"
+    - "II"
+  input_dims: [10, 10]
+  shared_rank: 10
+  specific_rank: 10
+  rank: 10
+  pruning_threshold: 0.2
+  batch_size: 256
+  lr: 0.001
+  prune: 0.1
+  checkpoint_pattern: "{ckpts_dir}/{dataset}_multi_loreft_lr{lr:.4f}_bs{bs}_rank{rank}_prune{prune:.2f}_{seed}_no_stage.pth"
+
+simulated_apollo:
+  data_path: "./data/simulated_data_apollo.npz"
+  task_names:
+    - shared
+    - m1
+    - m2
+  modality_names:
+    - "A"
+    - "B"
+  input_dims: [80, 40]
+  shared_rank: 40
+  specific_rank: 40
+  rank: 40
+  pruning_threshold: 0.2
+  batch_size: 256
+  lr: 0.001
+  prune: 0.1
+  checkpoint_pattern: "{ckpts_dir}/{dataset}_multi_loreft_lr{lr:.4f}_bs{bs}_rank{rank}_prune{prune:.2f}_{seed}_no_stage.pth"
+
+flickr:
+  checkpoint_path: "./ckpts/flickr_model_all.pth"
+  task_names:
+    - language
+  modality_names:
+    - image
+    - caption
+  input_dims: [768, 768]
+  shared_rank: 768
+  specific_rank: 768
+  rank: 700
+  pruning_threshold: 0.1
+  batch_size: 256
+  lr: 0.001
+  prune: 1.0
+  checkpoint_pattern: "{ckpts_dir}/{dataset}_multi_loreft_lr{lr:.4f}_bs{bs}_rank{rank}_prune{prune:.2f}_{seed}_no_stage.pth"
+
+vqa:
+  checkpoint_path: "./ckpts/vqa_model_all.pth"
+  task_names:
+    - answer
+  modality_names:
+    - image
+    - question
+  input_dims: [768, 768]
+  shared_rank: 128
+  specific_rank: 128
+  rank: 128
+  batch_size: 256
+  lr: 0.001
+  prune: 0.1
+  checkpoint_pattern: "{ckpts_dir}/{dataset}_multi_loreft_lr{lr:.4f}_bs{bs}_rank{rank}_prune{prune:.2f}_{seed}_no_stage.pth"
+
+cremad:
+  task_names:
+    - subject_id
+    - sentence_id
+    - emotion
+    - age
+    - sex
+    - race
+    - ethnicity
+  modality_names:
+    - video
+    - audio
+  shared_rank: 768
+  specific_rank: 768
+  rank: 700
+  pruning_threshold: 0.1
+  batch_size: 256
+  lr: 0.001
+  prune: 0.1
+  checkpoint_pattern: "{ckpts_dir}/{dataset}_multi_loreft_lr{lr:.4f}_bs{bs}_rank{rank}_prune{prune:.2f}_{seed}_no_stage.pth"
+
+urfunny:
+  task_names:
+    - humor
+  modality_names:
+    - video
+    - text
+  # input_dims loaded from dataset (video_dim, text_dim)
+  # shared_rank/specific_rank derived from input_dims for model (use input_dims[0/1])
+  # rank below used for checkpoint naming only
+  shared_rank: null
+  specific_rank: null
+  rank: 700
+  pruning_threshold: 0.1
+  batch_size: 128
+  lr: 0.001
+  prune: 0.1
+  checkpoint_pattern: "{ckpts_dir}/{dataset}_multi_loreft_lr{lr:.4f}_bs{bs}_rank{rank}_prune{prune:.2f}_{seed}_no_stage.pth"

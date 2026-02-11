@@ -1,3 +1,10 @@
+import sys
+import os as _os
+_script_dir = _os.path.dirname(_os.path.abspath(__file__))
+_project_root = _os.path.dirname(_script_dir)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 import torch
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
@@ -5,8 +12,9 @@ import os
 import random
 import torch.nn.functional as F
 from transformers import BertTokenizer
-from multimodal_projector import MultiLoReFT
-from utils import get_dino_preprocess
+
+from src.multimodal_projector import MultiLoReFT
+from src.utils import get_dino_preprocess
 
 class VQADataset(Dataset):
     def __init__(self, split='train', device='cuda', embedding_cache_dir="/data/stonekab/cached_vqa_feats"):
@@ -40,7 +48,7 @@ if __name__ == "__main__":
     print("Using device:", device)
 
     train_dataset = VQADataset(split="train")
-    train_dataset = torch.utils.data.Subset(train_dataset, range(8000))
+    train_dataset = torch.utils.data.Subset(train_dataset, range(5000))
     val_dataset = VQADataset(split="validation")
     val_dataset = torch.utils.data.Subset(val_dataset, range(1000))
 
@@ -56,7 +64,7 @@ if __name__ == "__main__":
         input_dims=[768, 768],
         shared_rank=768,
         specific_rank=768,
-        pruning_threshold=0.2,
+        pruning_threshold=0.1,
         device=device,
         staging=True,
         pruning=True,
@@ -64,9 +72,9 @@ if __name__ == "__main__":
     ).to(device)
 
     early_stopping_config = {
-        "shared": {"patience": 50, "min_improvement_ratio": 0.001, "max_epochs": 100},
-        "private": {"patience": 50, "min_improvement_ratio": 0.001, "max_epochs": 100},
-        "joint": {"patience": 50, "min_improvement_ratio": 0.001, "max_epochs": 2000}
+        "shared": {"patience": 100, "min_improvement_ratio": 0.001, "max_epochs": 100},
+        "private": {"patience": 100, "min_improvement_ratio": 0.001, "max_epochs": 100},
+        "joint": {"patience": 100, "min_improvement_ratio": 0.001, "max_epochs": 2000}
     }
 
     projection_model.train_projection(
