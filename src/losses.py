@@ -125,63 +125,62 @@ def loss_reconstruction(h1, h2, z_components, decoders, mode):
     l2 = F.mse_loss(h2, decoders[1](z2))
     return (l1 + l2) / 2
 
-def loss_mutual_info(h1, h2, z_components, mode="joint"):
+def loss_mutual_info(hs, z_components, mode="joint", return_all=False):
     """
     Maximize mutual information between original and projected representations.
-    Supports mismatched dimensions by projecting to a common space.
+    Supports mismatched dimensions by projecting the larger representation
+    down to the smaller dimensionality, matching the behavior of the second version.
     """
     class FixedProjector(torch.nn.Module):
+        """Random linear map R^{d_in} -> R^k."""
         def __init__(self, d_in, k, ortho=True, seed=0):
             super().__init__()
             g = torch.Generator().manual_seed(seed)
             W = torch.randn(d_in, k, generator=g) / (d_in**0.5)
             if ortho:
-                Q, _ = torch.linalg.qr(W, mode='reduced')
+                Q, _ = torch.linalg.qr(W, mode="reduced")
                 W = Q
-            self.register_buffer('W', W, persistent=False)
+            self.register_buffer("W", W, persistent=False)
 
         def forward(self, x):
             return x @ self.W
+    rand_int = 1#torch.randint(0, len(z_components), (1,)).item()
+    zs = [
+        torch.cat(
+            [z_components[(i + rand_int) % len(z_components)][1], z_components[i][0]], dim=1,
+        )
+        for i in range(len(z_components))
+    ]
 
-    if mode == "joint":
-        rnd = 1
-        z1 = torch.cat([z_components[rnd][1], z_components[0][0]], dim=1)
-        z2 = torch.cat([z_components[1-rnd][1], z_components[1][0]], dim=1)
-    elif mode == "shared":
-        rnd = torch.randint(0, 2, (1,)).item()
-        z1 = z_components[rnd][1]
-        z2 = z_components[1-rnd][1]
-    if mode == "private":
-        z1 = torch.cat([z_components[0][1], z_components[0][0]], dim=1)
-        z2 = torch.cat([z_components[1][1], z_components[1][0]], dim=1) 
-
-    # Handle dimension mismatch
-    if h1.shape[1] != z1.shape[1]:
-        proj_dim = min(h1.shape[1], z1.shape[1])
-        if h1.shape[1] > proj_dim:
-            h1 = FixedProjector(h1.shape[1], k=proj_dim, seed=123).to(h1.device)(h1)
-        if z1.shape[1] > proj_dim:
-            z1 = FixedProjector(z1.shape[1], k=proj_dim, seed=223).to(z1.device)(z1)
-    if h2.shape[1] != z2.shape[1]:
-        proj_dim = min(h2.shape[1], z2.shape[1])
-        if h2.shape[1] > proj_dim:
-            h2 = FixedProjector(h2.shape[1], k=proj_dim, seed=124).to(h2.device)(h2)
-        if z2.shape[1] > proj_dim:
-            z2 = FixedProjector(z2.shape[1], k=proj_dim, seed=224).to(z2.device)(z2)
-    
-    # Normalize representations
-    h1 = F.normalize(h1, dim=1)
-    h2 = F.normalize(h2, dim=1)
-    z1 = F.normalize(z1, dim=1)
-    z2 = F.normalize(z2, dim=1)
     temp = 0.01
-    labels = torch.arange(h1.size(0), device=h1.device)
-    logits1 = (h1 @ z1.T) / temp
-    logits2 = (h2 @ z2.T) / temp
-    
-    loss1 = F.cross_entropy(logits1, labels)
-    loss2 = F.cross_entropy(logits2, labels)
-    return (loss1 + loss2) / 2
+    losses = []
+
+    for i, (h, z) in enumerate(zip(hs, zs)):
+        # Match second version: only project if dimensions differ,
+        # and project the larger representation down to the smaller dimension
+        if h.shape[1] != z.shape[1]:
+            proj_dim = min(h.shape[1], z.shape[1])
+
+            if h.shape[1] > proj_dim:
+                proj = FixedProjector(h.shape[1], k=proj_dim, seed=100 + i).to(h.device)
+                h = proj(h)
+
+            if z.shape[1] > proj_dim:
+                proj = FixedProjector(z.shape[1], k=proj_dim, seed=200 + i).to(z.device)
+                z = proj(z)
+
+        h = F.normalize(h, dim=1)
+        z = F.normalize(z, dim=1)
+
+        labels = torch.arange(h.size(0), device=h.device)
+        logits = (h @ z.T) / temp
+        losses.append(F.cross_entropy(logits, labels))
+
+    if return_all:
+        return sum(losses) / len(losses), losses
+    else:
+        return sum(losses) / len(losses)
+
 
 def loss_invariance_m(phi1, phi2, model):
     """
@@ -265,7 +264,7 @@ def loss_cross_covariance(z_s1, z_s2, z_m1, z_m2):
     
     return loss
 
-def loss_orthogonality(R_s, R_m1, R_m2):
+def loss_orthogonality(R_s, R_ms):
     """
     Ensure orthogonality between shared and modality-specific spaces.
     """
@@ -275,11 +274,12 @@ def loss_orthogonality(R_s, R_m1, R_m2):
         prod = torch.mm(A, B.T)
         return (prod ** 2).mean()
 
-    loss_ortho_1 = ortho_pair(R_s, R_m1)
-    loss_ortho_2 = ortho_pair(R_m1, R_m2)
-    loss_ortho_3 = ortho_pair(R_s, R_m2)
-
-    return (loss_ortho_1 + loss_ortho_2 + loss_ortho_3)
+    loss_ortho = 0
+    for i in range(len(R_ms)):
+        loss_ortho += ortho_pair(R_s, R_ms[i])
+        for j in range(i+1, len(R_ms)):
+            loss_ortho += ortho_pair(R_ms[i], R_ms[j])
+    return loss_ortho
 
 def loss_shared_consistency(z_s1, z_s2):
     """
@@ -375,12 +375,17 @@ def hsic(x, y, sigma_x=None, sigma_y=None):
     hsic_val = torch.trace(torch.mm(Kc, Lc)) / ((n - 1)**2)
     return hsic_val
 
-def loss_independence(z_s1, z_s2, z_m1, z_m2, mod):
+def loss_independence(z_components):
     """
     Compute independence loss between shared and modality-specific representations.
     """
-    return hsic_rbf(z_s1, z_m1, unbiased=True) + hsic_rbf(z_s2, z_m2, unbiased=True) + hsic_rbf(z_m1, z_m2, unbiased=True)
-
+    loss = 0
+    for i,(zm,zs) in enumerate(z_components):
+        loss += hsic_rbf(zs, zm, unbiased=True)
+        for j in range(i+1, len(z_components)):
+            (zm2,zs2) = z_components[j]
+            loss += hsic_rbf(zm, zm2, unbiased=True)
+    return loss
 
 def center_gram(gram):
     """Center a Gram matrix."""

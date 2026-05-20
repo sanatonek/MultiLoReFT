@@ -35,7 +35,6 @@ class MultiLoReFT(nn.Module):
         staging=True,
         encoders=None,
         intervene_layer=-1,
-        shared_R_mode="double",
         pruning_threshold=0.05,
         pruning=True,
         device=None,
@@ -49,8 +48,8 @@ class MultiLoReFT(nn.Module):
         self.encoders = encoders
         self.dataset_name = dataset_name
         self.intervene_layer = intervene_layer
-        self.shared_R_mode = shared_R_mode
         self.input_dims = input_dims
+        self.modality_count = len(input_dims)
         if encoders is not None:
             for i in range(len(encoders)):
                 self.encoders[i] = encoders[i].to(device)
@@ -66,6 +65,7 @@ class MultiLoReFT(nn.Module):
             self.trainable_stage = "shared"
         else:
             self.trainable_stage = "joint"
+        self.n_loss_components = 3
         self.stage_tracking = {
             "best_val_loss": 5000,
             "best_val_MI_loss": 5000,
@@ -74,33 +74,38 @@ class MultiLoReFT(nn.Module):
         }
         self.max_dim = max(input_dims)
 
-        # Initialize projection matrices
-        if shared_R_mode == "double":
-            self.R_s1 = nn.Parameter(torch.randn(shared_rank, input_dims[0], dtype=torch.float32))
-            self.R_s2 = nn.Parameter(torch.randn(shared_rank, input_dims[1], dtype=torch.float32))
-            self.W_s0 = self._create_weight_networks(input_dims[0], self.shared_rank)
-            self.W_s1 = self._create_weight_networks(input_dims[1], self.shared_rank)
-            self.W_s0.apply(self._init_weights)
-            self.W_s1.apply(self._init_weights)
-            self.R_m1 = nn.Parameter(torch.randn(specific_rank, input_dims[0], dtype=torch.float32))
-            self.R_m2 = nn.Parameter(torch.randn(specific_rank, input_dims[1], dtype=torch.float32))
-            self.W_m0 = self._create_weight_networks(input_dims[0], self.specific_rank)
-            self.W_m0.apply(self._init_weights)
-            self.W_m1 = self._create_weight_networks(input_dims[1], self.specific_rank)
-            self.W_m1.apply(self._init_weights)
-        elif shared_R_mode == "pad":
-            self.R_s1 = nn.Parameter(torch.randn(shared_rank, self.max_dim, dtype=torch.float32))
-            self.W_s0 = self._create_weight_networks(self.max_dim, self.shared_rank)
-            self.W_s1 = self._create_weight_networks(self.max_dim, self.shared_rank)
-            self.W_s0.apply(self._init_weights)
-            self.W_s1.apply(self._init_weights)
-            self.R_m1 = nn.Parameter(torch.randn(specific_rank, self.max_dim, dtype=torch.float32))
-            self.R_m2 = nn.Parameter(torch.randn(specific_rank, self.max_dim, dtype=torch.float32))
-            self.W_m0 = self._create_weight_networks(self.max_dim, self.specific_rank)
-            self.W_m0.apply(self._init_weights)
-            self.W_m1 = self._create_weight_networks(self.max_dim, self.specific_rank)
-            self.W_m1.apply(self._init_weights)
+        # Initialize projection matrices (use ModuleList/ParameterList so .to(device) moves all submodules)
+        self.R_s1 = nn.Parameter(torch.randn(shared_rank, self.max_dim, dtype=torch.float32))
+        self.R_ms = nn.ParameterList(
+            [
+                nn.Parameter(torch.randn(specific_rank, self.max_dim, dtype=torch.float32))
+                for _ in range(self.modality_count)
+            ]
+        )
+        self.W_ms = nn.ModuleList(
+            [self._create_weight_networks(self.max_dim, self.specific_rank) for _ in range(self.modality_count)]
+        )
+        self.W_ss = nn.ModuleList(
+            [self._create_weight_networks(self.max_dim, self.shared_rank) for _ in range(self.modality_count)]
+        )
+        for i in range(self.modality_count):
+            self.W_ss[i].apply(self._init_weights)
+            self.W_ms[i].apply(self._init_weights)
         self._orthogonal_init()
+
+    def _params_shared_head(self):
+        """Flat list: R_s1 + all W_ss parameters (for optimizer / pruning)."""
+        params = [self.R_s1]
+        for i in range(self.modality_count):
+            params.extend(list(self.W_ss[i].parameters()))
+        return params
+
+    def _params_private_head(self):
+        """Flat list: all R_ms + all W_ms parameters."""
+        params = [self.R_ms[i] for i in range(self.modality_count)]
+        for i in range(self.modality_count):
+            params.extend(list(self.W_ms[i].parameters()))
+        return params
 
     def _create_weight_networks(self, input_dim, output_dim):
         """Create weight networks for each modality."""
@@ -119,43 +124,22 @@ class MultiLoReFT(nn.Module):
 
     def _orthogonal_init(self):
         nn.init.orthogonal_(self.R_s1, gain=1)
-        nn.init.orthogonal_(self.R_m1, gain=1)
-        nn.init.orthogonal_(self.R_m2, gain=1)
-        if self.shared_R_mode == "double":
-            nn.init.orthogonal_(self.R_s2, gain=1)
+        for i in range(self.modality_count):
+            nn.init.orthogonal_(self.R_ms[i], gain=1)
 
     def get_trainable_parameters(self):
         """Get parameters to train based on current stage."""
         if self.trainable_stage == "shared":
-            if self.shared_R_mode == "double":
-                return [self.R_s1, self.R_s2] + list(self.W_s0.parameters()) + list(self.W_s1.parameters())
-            else:
-                return [self.R_s1] + list(self.W_s0.parameters()) + list(self.W_s1.parameters())
+            return self._params_shared_head()
         elif self.trainable_stage == "private":
-            return [self.R_m1, self.R_m2] + list(self.W_m0.parameters()) + list(self.W_m1.parameters())
+            return self._params_private_head()
         elif self.trainable_stage == "joint":
-            if self.shared_R_mode == "double":
-                return (
-                    [self.R_m1, self.R_m2, self.R_s1, self.R_s2]
-                    + list(self.W_m0.parameters())
-                    + list(self.W_m1.parameters())
-                    + list(self.W_s0.parameters())
-                    + list(self.W_s1.parameters())
-                )
-            else:
-                return (
-                    [self.R_m1, self.R_m2, self.R_s1]
-                    + list(self.W_m0.parameters())
-                    + list(self.W_m1.parameters())
-                    + list(self.W_s0.parameters())
-                    + list(self.W_s1.parameters())
-                )
+            return self._params_shared_head() + self._params_private_head()
         else:
             raise ValueError(f"Unknown training stage: {self.trainable_stage}")
 
     def prune_singular_values(self, single=False):
         """Prune singular values below threshold and update network weights."""
-
         def prune_matrix(name, R, weights_to_prune):
             if R.shape[0] < 3:
                 return R, R.shape[0], False
@@ -172,7 +156,7 @@ class MultiLoReFT(nn.Module):
                 print(f"Number of singular values below threshold (total size: {len(S)}): {num_below}")
                 if num_below == 0:
                     return R, len(S), False
-                n_remove = max(1, min(num_below, int(0.1 * len(S) + 1)))
+                n_remove = max(1, min(num_below, int(0.1 * len(S) )))
             k = R.shape[0] - n_remove
             reduced_R = S[:k].unsqueeze(1) * Vh[:k, :]
             reduced_R = reduced_R.to(device=self.device, dtype=torch.float32)
@@ -199,102 +183,63 @@ class MultiLoReFT(nn.Module):
             return reduced_R, k, True
 
         kept_s1, kept_s2, kept_m1, kept_m2 = 0, 0, 0, 0
-        if self.shared_R_mode == "double":
-            pruned_R, kept_s1, is_pruned = prune_matrix("R_s1", self.R_s1, [self.W_s0])
-            if is_pruned:
-                self.shared_rank = kept_s1
-                self.R_s1 = nn.Parameter(pruned_R)
-                self.optimizer.param_groups[0]["params"] = (
-                    [self.R_s1, self.R_s2] + list(self.W_s0.parameters()) + list(self.W_s1.parameters())
-                )
-            pruned_R, kept_s2, is_pruned = prune_matrix("R_s2", self.R_s2, [self.W_s1])
-            if is_pruned:
-                self.shared_rank = kept_s2
-                self.R_s2 = nn.Parameter(pruned_R)
-                self.optimizer.param_groups[0]["params"] = (
-                    [self.R_s1, self.R_s2] + list(self.W_s0.parameters()) + list(self.W_s1.parameters())
-                )
-        else:
-            pruned_R, kept_s1, is_pruned = prune_matrix("R_s1", self.R_s1, [self.W_s0, self.W_s1])
-            if is_pruned:
-                self.shared_rank = kept_s1
-                self.R_s1 = nn.Parameter(pruned_R)
-                self.optimizer.param_groups[0]["params"] = (
-                    [self.R_s1] + list(self.W_s0.parameters()) + list(self.W_s1.parameters())
-                )
+        pruned_R, kept_s1, is_pruned = prune_matrix("R_s1", self.R_s1, [self.W_ss[i] for i in range(self.modality_count)])
+        if is_pruned:
+            self.shared_rank = kept_s1
+            self.R_s1 = nn.Parameter(pruned_R)
+            self.optimizer.param_groups[0]["params"] = self._params_shared_head()
 
-        pruned_R, kept_m1, is_pruned = prune_matrix("R_m1", self.R_m1, [self.W_m0])
-        if is_pruned:
-            self.specific_rank = kept_m1
-            self.R_m1 = nn.Parameter(pruned_R)
-            self.optimizer.param_groups[1]["params"] = (
-                [self.R_m1, self.R_m2] + list(self.W_m0.parameters()) + list(self.W_m1.parameters())
-            )
-        pruned_R, kept_m2, is_pruned = prune_matrix("R_m2", self.R_m2, [self.W_m1])
-        if is_pruned:
-            self.specific_rank = kept_m2
-            self.R_m2 = nn.Parameter(pruned_R)
-            self.optimizer.param_groups[1]["params"] = (
-                [self.R_m1, self.R_m2] + list(self.W_m0.parameters()) + list(self.W_m1.parameters())
-            )
+        for i in range(self.modality_count):
+            pruned_R, kept_m, is_pruned = prune_matrix(f"R_m{i}", self.R_ms[i], [self.W_ms[i]])
+            if is_pruned:
+                self.specific_rank = kept_m
+                self.R_ms[i] = nn.Parameter(pruned_R)
+                self.optimizer.param_groups[1]["params"] = self._params_private_head()
         self.optimizer.state = defaultdict(dict, self.optimizer.state)
 
     def forward(self, embeddings):
-        h1 = F.normalize(embeddings[0], p=2, dim=-1)
-        h2 = F.normalize(embeddings[1], p=2, dim=-1)
+        hs = [F.normalize(embedding, p=2, dim=-1) for embedding in embeddings]
 
-        if self.input_dims[0] != self.input_dims[1] and self.shared_R_mode == "pad":
-            h1 = F.pad(h1, (0, self.max_dim - h1.shape[1]))
-            h2 = F.pad(h2, (0, self.max_dim - h2.shape[1]))
+        if len(np.unique(self.input_dims)) > 1:
+            hs = [F.pad(h, (0, self.max_dim - h.shape[1])) for h in hs]
 
-        proj_s0 = self.W_s0(h1) - F.linear(h1, self.R_s1)
-        shared_h1 = F.linear(proj_s0, self.R_s1.T)
-
-        proj_s1 = self.W_s1(h2) - F.linear(h2, (self.R_s1 if self.shared_R_mode == "pad" else self.R_s2))
-        shared_h2 = F.linear(proj_s1, (self.R_s1.T if self.shared_R_mode == "pad" else self.R_s2.T))
-
-        proj_m0 = self.W_m0(h1) - F.linear(h1, self.R_m1)
-        spec_h1 = F.linear(proj_m0, self.R_m1.T)
-
-        proj_m1 = self.W_m1(h2) - F.linear(h2, self.R_m2)
-        spec_h2 = F.linear(proj_m1, self.R_m2.T)
-
-        phi1 = h1 + shared_h1 + spec_h1
-        phi2 = h2 + shared_h2 + spec_h2
-        return phi1, phi2
+        phis = []
+        for ind,h in enumerate(hs):
+            proj_s = self.W_ss[ind](h) - F.linear(h, self.R_s1)
+            shared_h = F.linear(proj_s, self.R_s1.T)
+            proj_m = self.W_ms[ind](h) - F.linear(h, self.R_ms[ind])
+            spec_h = F.linear(proj_m, self.R_ms[ind].T)
+            phi = h + shared_h + spec_h
+            phis.append(phi)
+        return phis
 
     def decouple(self, phis, full=True, th=0.1):
         """Separate shared and modality-specific representations."""
         rep_components = []
         for i, phi in enumerate(phis):
-            zs = F.linear(
-                phi,
-                self.R_s1 if i == 0 else (self.R_s1 if self.shared_R_mode == "pad" else self.R_s2),
-            )
-            zm = F.linear(phi, (self.R_m1 if i == 0 else self.R_m2))
+            zs = F.linear(phi, self.R_s1)
+            zm = F.linear(phi, self.R_ms[i])
             rep_components.append((zm, zs))
         return rep_components
 
     def fuse_representations(self, phis):
         """Fuse representations."""
-        zs1 = F.linear(phis[0], self.R_s1)
-        zm1 = F.linear(phis[0], self.R_m1)
-        zs2 = F.linear(phis[1], self.R_s1 if self.shared_R_mode == "pad" else self.R_s2)
-        zm2 = F.linear(phis[1], self.R_m2)
-        mean_zs = (zs1 + zs2) / 2
-        return torch.cat((zm1, zm2, mean_zs), dim=-1)
+        zs_list = []
+        zm_list = []
+        for ind, phi in enumerate(phis):
+            zs_list.append(F.linear(phi, self.R_s1))
+            zm_list.append(F.linear(phi, self.R_ms[ind]))
+        mean_zs = sum(zs_list) / len(zs_list)
+        return torch.cat((*zm_list, mean_zs), dim=-1)
 
-    def compute_stage_losses(self, h1, h2, phis, z_components):
+    def compute_stage_losses(self, hs, phis, z_components, return_distortion_metrics=False):
         """Compute losses based on current training stage."""
-        l_orthogonality = loss_orthogonality(self.R_s1, self.R_m1, self.R_m2)
-        l_independence = loss_independence(
-            z_s1=z_components[0][1],
-            z_s2=z_components[1][1],
-            z_m1=z_components[0][0],
-            z_m2=z_components[1][0],
-            mod=1,
-        )
-        l_mi = loss_mutual_info(h1, h2, z_components, mode=self.trainable_stage)
+        l_orthogonality = loss_orthogonality(self.R_s1, self.R_ms)
+        l_independence = loss_independence(z_components)
+        if return_distortion_metrics:
+            l_mi, l_mi_components = loss_mutual_info(hs, z_components, mode=self.trainable_stage, return_all=True)
+        else:
+            l_mi = loss_mutual_info(hs, z_components, mode=self.trainable_stage)
 
         all_losses = [l_orthogonality.item(), l_independence.item(), l_mi.item()]
         all_loss_names = ["Orthogonality Loss", "Independence Loss", "Mutual Info Loss"]
@@ -312,7 +257,16 @@ class MultiLoReFT(nn.Module):
             )
         elif self.trainable_stage == "joint":
             self.n_loss_components = 3
-            return (
+            if return_distortion_metrics:
+                return (
+                    [l_orthogonality, l_independence, l_mi],
+                    ["Orthogonality Loss", "Independence Loss", "Mutual Info Loss"],
+                    all_losses,
+                    all_loss_names,
+                    l_mi_components,
+                )
+            else:
+                return (
                 [l_orthogonality, l_independence, l_mi],
                 ["Orthogonality Loss", "Independence Loss", "Mutual Info Loss"],
                 all_losses,
@@ -369,8 +323,8 @@ class MultiLoReFT(nn.Module):
                 phis = self.forward([h1, h2])
 
                 z_components = self.decouple(phis, full=True)
-                losses_list, _, all_losses_list, _ = self.compute_stage_losses(
-                    h1, h2, phis, z_components
+                losses_list, _, all_losses_list, _, val_mi_components = self.compute_stage_losses(
+                    [h1, h2], phis, z_components, return_distortion_metrics=True
                 )
                 val_loss = torch.stack(losses_list).mean()
                 val_total_loss += val_loss.item()
@@ -405,42 +359,13 @@ class MultiLoReFT(nn.Module):
         print(f"Model is on device: {next(self.parameters()).device}")
         self.lr = lr
         trainable_params = self.get_trainable_parameters()
-        if self.shared_R_mode == "double":
-            self.optimizer = torch.optim.Adam(
-                [
-                    {
-                        "params": [self.R_s1, self.R_s2]
-                        + list(self.W_s0.parameters())
-                        + list(self.W_s1.parameters()),
-                        "lr": lr,
-                    },
-                    {
-                        "params": [self.R_m1, self.R_m2]
-                        + list(self.W_m0.parameters())
-                        + list(self.W_m1.parameters()),
-                        "lr": lr,
-                    },
-                ],
-                weight_decay=1e-3,
-            )
-        else:
-            self.optimizer = torch.optim.Adam(
-                [
-                    {
-                        "params": [self.R_s1]
-                        + list(self.W_s0.parameters())
-                        + list(self.W_s1.parameters()),
-                        "lr": lr,
-                    },
-                    {
-                        "params": [self.R_m1, self.R_m2]
-                        + list(self.W_m0.parameters())
-                        + list(self.W_m1.parameters()),
-                        "lr": lr,
-                    },
-                ],
-                weight_decay=1e-3,
-            )
+        self.optimizer = torch.optim.Adam(
+            [
+                {"params": self._params_shared_head(), "lr": lr},
+                {"params": self._params_private_head(), "lr": lr},
+            ],
+            weight_decay=1e-3,
+        )
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=500
         )
@@ -450,9 +375,10 @@ class MultiLoReFT(nn.Module):
         total_loss_list = []
         total_val_loss_list = []
 
+        loss_balancer = GradientNormalizedLoss(num_losses=self.n_loss_components)
         for epoch in range(epochs):
             epoch_loss = 0
-            epoch_loss_components = [0, 0, 0]
+            epoch_loss_components = [0]*self.n_loss_components
             for batch in dataloader:
                 if self.encoders is not None:
                     x1, x2, label = batch
@@ -467,13 +393,9 @@ class MultiLoReFT(nn.Module):
                             x2, padding=True, truncation=True, return_tensors="pt"
                         ).to(self.device)
                         model_output = self.encoders[2](**tokens_fr)
-                        embeddings_fr = model_output.last_hidden_state[
-                            :, 0, :
-                        ].to(self.device)
+                        embeddings_fr = model_output.last_hidden_state[:, 0, :].to(self.device)
                         model_output = self.encoders[1](**tokens_en)
-                        embeddings_en = model_output.last_hidden_state[
-                            :, 0, :
-                        ].to(self.device)
+                        embeddings_en = model_output.last_hidden_state[:, 0, :].to(self.device)
                         h1 = self.encoders[0].forward_features(x1)[:, 0, :].to(
                             self.device
                         )
@@ -493,22 +415,23 @@ class MultiLoReFT(nn.Module):
                             .unsqueeze(2)
                             .expand(-1, -1, h2[0].shape[-1]),
                         ).squeeze(1)
+                        hs = [h1, h2]
                     else:
-                        h1 = batch[0]
-                        h2 = batch[1]
+                        hs = [batch[i] for i in range(self.modality_count)]
 
-                h1 = h1.to(self.device)
-                h2 = h2.to(self.device)
-                phis = self.forward([h1, h2])
+                hs = [h.to(self.device) for h in hs]
+                phis = self.forward(hs)
 
                 z_components = self.decouple(phis, full=True)
                 losses_list, loss_names, all_losses, all_loss_names = self.compute_stage_losses(
-                    h1, h2, phis, z_components
+                    hs, phis, z_components
                 )
-
+                
+                
                 losses = torch.stack(losses_list)
-                weights = [1.0, 1.0, 1.0]
-                loss = sum(weights[i] * losses_i for i, losses_i in enumerate(losses))
+                loss, weights = loss_balancer(losses, trainable_params)
+                # weights = [1.0, 1.0, 1.0]
+                # loss = sum(weights[i] * losses_i for i, losses_i in enumerate(losses))
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -516,41 +439,41 @@ class MultiLoReFT(nn.Module):
                 self.scheduler.step()
 
                 epoch_loss += loss.item()
-                for i in range(3):
+                for i in range(self.n_loss_components):
                     epoch_loss_components[i] += all_losses[i]
-                del h1, h2, phis, z_components
+                del hs, phis, z_components
                 torch.cuda.empty_cache()
 
             total_loss_list.append(epoch_loss / len(dataloader))
-            for i in range(3):
+            for i in range(self.n_loss_components):
                 epoch_loss_list[i].append(epoch_loss_components[i] / len(dataloader))
 
             val_loss, val_loss_components = self.evaluate_validation_loss(
                 val_dataloader, **kwargs
             )
             total_val_loss_list.append(val_loss)
-            for i in range(3):
+            for i in range(self.n_loss_components):
                 val_loss_list[i].append(val_loss_components[i] / len(val_dataloader))
+
+            if len(total_val_loss_list) >= 5:
+                recent_avg_val_loss = np.mean(total_val_loss_list[-5:])
+                recent_avg_mi_loss = np.mean(val_loss_list[-1][-5:])
+            else:
+                recent_avg_val_loss = np.mean(total_val_loss_list)
+                recent_avg_mi_loss = np.mean(val_loss_list[-1][-1])
 
             if self.pruning:
                 if (
                     self.trainable_stage == "joint"
-                    and abs(val_loss_list[-1][-1])
-                    <= abs(1.01 * self.stage_tracking["best_val_MI_loss"])
-                    and epoch > self.stage_switches[-1][-1] + 50
+                    and abs(val_loss_list[-1][-1])  <= abs(1.01 * self.stage_tracking["best_val_MI_loss"])
+                    # and abs(recent_avg_mi_loss)  <= abs(1.01 * self.stage_tracking["best_val_MI_loss"])
+                    and epoch > self.stage_switches[-1][-1] + 100
                 ):
                     self.prune_singular_values()
 
             if self.staging or self.trainable_stage == "joint":
                 stage_config = early_stopping_config[self.trainable_stage]
                 self.stage_tracking["min_epochs_counter"] += 1
-
-                if len(total_val_loss_list) >= 5:
-                    recent_avg_val_loss = np.mean(total_val_loss_list[-5:])
-                    recent_avg_mi_loss = np.mean(val_loss_list[-1][-3:])
-                else:
-                    recent_avg_val_loss = np.mean(total_val_loss_list)
-                    recent_avg_mi_loss = np.mean(val_loss_list[-1][-1])
                 relative_improvement = (
                     self.stage_tracking["best_val_loss"] - recent_avg_val_loss
                 ) / self.stage_tracking["best_val_loss"]
@@ -558,7 +481,7 @@ class MultiLoReFT(nn.Module):
                     self.stage_tracking["best_val_loss"] = recent_avg_val_loss
                 if (
                     self.trainable_stage == "joint"
-                    and val_loss_list[-1][-1] < self.stage_tracking["best_val_MI_loss"]
+                    and recent_avg_mi_loss < self.stage_tracking["best_val_MI_loss"]
                 ):
                     self.stage_tracking["best_val_MI_loss"] = recent_avg_mi_loss
 
@@ -578,10 +501,10 @@ class MultiLoReFT(nn.Module):
             wandb.log({"Validation Independence Loss": val_loss_list[1][-1]})
             wandb.log({"Validation Mutual Info Loss": val_loss_list[2][-1]})
             wandb.log({"Shared rank": self.R_s1.shape[0]})
-            wandb.log({"Specific rank I": self.R_m1.shape[0]})
-            wandb.log({"Specific rank II": self.R_m2.shape[0]})
+            for i in range(self.modality_count):
+                wandb.log({f"Specific rank modality {i}": self.R_ms[i].shape[0]})
 
-            if epoch % 1 == 0:
+            if epoch % 5 == 0:
                 print(
                     f"[Epoch {epoch}] {self.trainable_stage.upper()} stage: "
                     f"val_loss={val_loss:.4f}, "
