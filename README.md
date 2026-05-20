@@ -6,56 +6,6 @@ MultiLoReFT learns to decompose multimodal embeddings into **shared** and **moda
 
 ---
 
-## The Model
-
-MultiLoReFT projects two modality embeddings \( h_1, h_2 \) through learnable low-rank matrices:
-
-- **Shared subspace** (\( R_s \)): Captures information that is aligned across modalities (e.g., sentiment, identity, content).
-- **Modality-specific subspaces** (\( R_{m1}, R_{m2} \)): Capture information unique to each modality.
-
-The model is trained with:
-- **Orthogonality loss**: Keeps shared and modality-specific subspaces distinct.
-- **Independence loss**: Encourages shared and modality-specific representations to be statisticallly independant.
-- **Mutual information loss**: Balances shared vs. modality-specific information.
-
-**Staged training** is used: first train the shared subspace, then the modality-specific subspaces, then jointly. Optional **singular-value pruning** removes weak dimensions during training to adapt rank automatically.
-
-**Output representations**:
-- `decouple()`: Returns \( (z_m, z_s) \) per modality — modality-specific and shared components.
-- `fuse_representations()`: Concatenates \( z_{m1}, z_{m2}, \bar{z}_s \) for downstream tasks.
-
----
-
-## Project Structure
-
-```
-multimodal_LoReFT/
-├── configs/
-│   ├── datasets.yaml      # Dataset-specific configuration (model params, paths, tasks)
-│   └── load.py            # Config loading utilities
-├── src/
-│   ├── multimodal_projector.py   # MultiLoReFT model
-│   ├── losses.py                 # Orthogonality, independence, MI losses
-│   ├── utils.py                  # Checkpoint loading, SklearnTrainer
-│   ├── data/
-│   │   └── base.py               # MultimodalDataset (h1, h2, x1, x2, labels)
-│   └── baselines/                # Apollo, contrastive, DRIM baselines
-├── scripts/
-│   ├── simulation.py             # Train MultiLoReFT on simulated/simulated_apollo
-│   ├── cremad.py                 # CremadDataset + train on CREMA-D
-│   ├── flickr.py                 # Multi30KMixedLangDataset (Flickr30k)
-│   ├── urfunny.py                # UrFunnyDataset (humor detection)
-│   ├── vqa.py                    # VQADataset (VQA v2)
-│   ├── evaluate_representations.py   # Evaluate predictability of shared vs modality-specific
-│   └── baselines/                # Launchers for Apollo, contrastive, DRIM
-├── preprocessing/            # Feature extraction scripts
-└── data/                     # Simulated .npz files (gitignored)
-```
-
-**Design principle**: Each dataset has a dedicated script (e.g., `cremad.py`, `flickr.py`) that defines a `Dataset` class yielding `(h1, h2, ...)` where `h1` and `h2` are precomputed feature tensors for the two modalities. All datasets share the same `MultiLoReFT` model and training loop structure.
-
----
-
 ## Quick Start
 
 Run all commands from the **project root**:
