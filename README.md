@@ -5,7 +5,8 @@
 MultiLoReFT learns to decompose multimodal embeddings into **shared** and **modality-specific** subspaces using low-rank projection matrices. The model enables downstream analysis of what information is common across modalities (e.g., emotion in video+audio) versus what is unique to each (e.g., visual style, acoustic texture).
 
 
-[multiloreft_overview.pdf](https://github.com/user-attachments/files/28072986/multiloreft_overview.pdf)
+<img width="27076" height="9848" alt="multiloreft_overview" src="https://github.com/user-attachments/assets/9670cabb-dae6-4e5d-a073-ef2062753217" />
+
 
 
 ---
